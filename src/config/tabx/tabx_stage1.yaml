@@ -1,0 +1,47 @@
+data:
+  manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/overfit16_l64/manifest.json
+  normalization: /mnt/cfs/shaopt/data/MARL/maicc_tabx/overfit16_l64/obs_normalization.npz
+  h5_lru_size: 16
+  normalization_clip: 10.0
+  preserve_zero_padding: true
+
+model:
+  # Must match the stage-0 checkpoint architecture exactly.
+  agent: tabx_transformer
+  max_agents: 20
+  n_embd: 64
+  n_layer: 4
+  n_head: 4
+  hidden_dim: 128
+  dropout: 0.1
+  use_rtg: false
+  train_cem: false
+
+training:
+  device: auto
+  seed: 7
+  total_steps: 100000
+  max_batch_size: 4
+  agent_time_budget: 4096
+  learning_rate: 0.0005
+  grad_norm_clip: 10.0
+  use_amp: false
+  max_return: auto
+  min_return: auto
+  log_interval: 100
+  progress_interval: 100
+  save_interval: 10000
+  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/overfit16_stage1
+
+retrieval:
+  k: 2
+  search_k: 64
+  max_similarity: 0.98
+  anchor_stride: 8
+  index_batch_rows: 8
+  # Bound exact-FAISS size. Increase only after checking host RAM and index
+  # latency; rows are selected evenly across each task.
+  max_index_rows_per_task: 1024
+  stage0_checkpoint: /mnt/cfs/shaopt/data/MARL/maicc_results/overfit16_stage0/step_000100000
+  index_dir: /mnt/cfs/shaopt/data/MARL/maicc_tabx/overfit16_l64/retrieval
+  index_manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/overfit16_l64/retrieval/retrieval_manifest.json

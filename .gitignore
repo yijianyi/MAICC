@@ -3,3 +3,9 @@ results/
 *.pdf
 *.th
 *.pkl
+.vscode/
+/TABXdata/
+/datasets/tabx*/
+
+# Local training datasets
+/datasets/

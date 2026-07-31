@@ -33,3 +33,10 @@ bash lbf_small_train.sh
 bash lbf_train.sh
 bash sc2v2_train.sh
 ```
+
+### Train on TABX offline data
+
+TABX uses a separate streaming adapter so the original Gymma and SMACv2
+training paths remain unchanged. Server preparation, stage-0, retrieval index,
+and stage-1 commands are documented in
+[`docs/TABX_TRAINING.md`](docs/TABX_TRAINING.md).
