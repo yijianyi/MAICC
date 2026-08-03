@@ -3,3 +3,6 @@ results/
 *.pdf
 *.th
 *.pkl
+
+# Local training datasets
+/datasets/

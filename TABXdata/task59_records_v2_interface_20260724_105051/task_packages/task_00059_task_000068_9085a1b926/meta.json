@@ -1,0 +1,8 @@
+{
+  "algorithm": "mappo",
+  "seed": 1059,
+  "source_oracle_dir": "/mnt/cfs/shaopt/code/AnyTABX_diversity_test/outputs/parallel_train_mentor_stage2_all_1e7_debug_gpu4_7_24coach/task_00059_seed_1059/mappo/task-000059-task_000068_9085a1b926/seed-1059",
+  "source_task_bank": "/mnt/cfs/shaopt/data/MARL/task_file/2026-07-16_1027/tasks1_balanced.json",
+  "task_id": "task_000068_9085a1b926",
+  "task_index": 59
+}
