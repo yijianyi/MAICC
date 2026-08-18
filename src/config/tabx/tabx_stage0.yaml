@@ -1,0 +1,52 @@
+# Server-ready TABX stage-0 configuration.
+#
+# Raw dataset:
+# /mnt/cfs/shaopt/data/MARL/0803_overfit_7task_train_7000record_balance_winrate
+
+data:
+  manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/manifest.json
+  normalization: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/obs_normalization.npz
+  h5_lru_size: 16
+  normalization_clip: 10.0
+  preserve_zero_padding: true
+
+model:
+  # tabx_transformer replaces only the centralized CEM with factorized
+  # spatial/temporal attention. DEM and DT retain the original MAICC code.
+  agent: tabx_transformer
+  max_agents: 10
+  episode_limit: 512
+  n_embd: 64
+  n_layer: 8
+  n_head: 8
+  hidden_dim: 128
+  n_zones: 4
+  obs_visible_weight: 4.0
+  dropout: 0.1
+  encoder_use_rtg: false
+  policy_use_rtg: true
+  train_cem: true
+
+training:
+  device: auto
+  seed: 7
+  total_steps: 100000
+  max_batch_size: 4
+  agent_time_budget: 4096
+  learning_rate: 0.0005
+  grad_norm_clip: 10.0
+  use_amp: false
+  max_return: auto
+  min_return: auto
+  log_interval: 100
+  progress_interval: 100
+  # CSV metrics are lightweight enough to retain every optimization step.
+  metrics_interval: 1
+  metrics_file: training_metrics.csv
+  save_interval: 10000
+  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage0
+
+retrieval:
+  k: 2
+  search_k: 128
+  max_similarity: 0.98

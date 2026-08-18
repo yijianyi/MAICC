@@ -335,14 +335,18 @@ class TransformerAgent(nn.Module):
             self.EM_pre_embd = nn.Linear(1, self.n_embd)  # [rtg]
         self.EM_obs_embd = nn.Sequential(
             nn.Linear(input_shape, self.args.hidden_dim), nn.ReLU(), nn.Linear(self.args.hidden_dim, self.args.hidden_dim), nn.ReLU(), nn.Linear(self.args.hidden_dim, self.n_embd))
-        self.EM_action_embd = nn.Embedding(self.max_actions, self.n_embd)
+        # TABX reserves one internal-only action token for a causally unknown
+        # current action. Environment logits/actions still have max_actions=8.
+        self.action_vocab_size = self.max_actions + (1 if args.env == "tabx" else 0)
+        self.unknown_action_id = self.max_actions if args.env == "tabx" else None
+        self.EM_action_embd = nn.Embedding(self.action_vocab_size, self.n_embd)
         self.EM_post_embd = nn.Linear(
             3, self.n_embd)  # [rew, term, completion]
 
         self.DT_pre_embd = nn.Linear(1, self.n_embd)  # [rtg]
         self.DT_obs_embd = nn.Sequential(
             nn.Linear(input_shape, self.args.hidden_dim), nn.ReLU(), nn.Linear(self.args.hidden_dim, self.args.hidden_dim), nn.ReLU(), nn.Linear(self.args.hidden_dim, self.n_embd))
-        self.DT_action_embd = nn.Embedding(self.max_actions, self.n_embd)
+        self.DT_action_embd = nn.Embedding(self.action_vocab_size, self.n_embd)
         self.DT_post_embd = nn.Linear(
             3, self.n_embd)  # [rew, term, completion]
 
@@ -361,16 +365,50 @@ class TransformerAgent(nn.Module):
         self.log_var_offset = Scalar(-1.0)
         self.gauss_nll_loss = nn.GaussianNLLLoss(reduction='none')
 
-    def train_EM(self, seq_pre, seq_obs, seq_action, seq_post, mask):
-        idx_mask = th.nonzero(mask.reshape(-1)).reshape(-1)
+    def train_EM(self, seq_pre, seq_obs, seq_action, seq_post, mask, present_mask=None):
         batch_size, seq_len, n_agents = seq_obs.shape[0], seq_obs.shape[1], seq_obs.shape[2]
+        time_mask = mask.squeeze(-1).bool()
+        if present_mask is None:
+            present_mask = th.ones(
+                batch_size, seq_len, n_agents, device=seq_obs.device,
+                dtype=th.bool,
+            )
+        else:
+            present_mask = present_mask.squeeze(-1).bool()
+        agent_mask = time_mask.unsqueeze(-1) & present_mask
+        if not agent_mask.any():
+            raise ValueError(
+                "train_EM received a batch with no valid present-agent "
+                "action timestep"
+            )
+        idx_mask = th.nonzero(time_mask.reshape(-1)).reshape(-1)
         if self.args.env == "sc2v2":
             ori_dim = seq_obs.shape[-1]
             seq_obs = F.pad(seq_obs, (0, self.input_shape - ori_dim))
-        target_action = seq_action.reshape(
-            batch_size * seq_len, -1)[idx_mask].flatten()
+        target_action = seq_action[agent_mask]
         target_reward = seq_post[:, :, 0].reshape(-1)[idx_mask]
         target_obs = seq_obs
+        obs_feature_weight = th.ones_like(target_obs)
+        if self.args.env == "tabx":
+            # Invisible/padded other-unit blocks are all zero in TABX. Keep
+            # them as valid transition targets, but upweight visible blocks so
+            # the Gaussian loss cannot be minimized mostly by predicting zero.
+            n_zones = int(getattr(self.args, "n_zones", 4))
+            other_blocks = max(
+                0, (self.input_shape - 14 - 6 * n_zones) // 16
+            )
+            visible_weight = float(
+                getattr(self.args, "obs_visible_weight", 4.0)
+            )
+            for block in range(other_blocks):
+                start = 14 + 16 * block
+                end = start + 16
+                visible = (
+                    target_obs[..., start:end].abs().sum(-1, keepdim=True) > 0
+                ).float()
+                obs_feature_weight[..., start:end] = (
+                    1.0 + (visible_weight - 1.0) * visible
+                )
 
         if self.args.train_CEM:
             CEM_inputs = []
@@ -382,7 +420,13 @@ class TransformerAgent(nn.Module):
                     CEM_inputs.append(self.EM_action_embd(seq_action[:, t, i]))
                 CEM_inputs.append(self.EM_post_embd(seq_post[:, t]))
             CEM_inputs = th.stack(CEM_inputs, dim=1)
-            CEM_outputs = self.CEM.custom_forward(CEM_inputs, n_agents)[
+            if self.args.env == "tabx":
+                cem_result = self.CEM.custom_forward(
+                    CEM_inputs, n_agents, present_mask=present_mask
+                )
+            else:
+                cem_result = self.CEM.custom_forward(CEM_inputs, n_agents)
+            CEM_outputs = cem_result[
                 'last_hidden_state']
             CEM_z_os = []
             for i in range(n_agents):
@@ -393,8 +437,7 @@ class TransformerAgent(nn.Module):
                     CEM_z_os.append(
                         CEM_outputs[:, i * 2::(1 + 2 * n_agents)])
             CEM_z_os = th.stack(CEM_z_os, dim=2)
-            CEM_action_out = self.EM_pred_actions(CEM_z_os).reshape(
-                batch_size * seq_len, -1)[idx_mask].reshape(-1, self.max_actions)
+            CEM_action_out = self.EM_pred_actions(CEM_z_os)[agent_mask]
             CEM_action_loss = F.cross_entropy(CEM_action_out, target_action)
 
             CEM_z_as = []
@@ -406,8 +449,10 @@ class TransformerAgent(nn.Module):
                     CEM_z_as.append(
                         CEM_outputs[:, 1 + i * 2::(1 + 2 * n_agents)])
             CEM_z_as = th.stack(CEM_z_as, dim=2)
-            CEM_reward_out = self.EM_pred_reward(CEM_z_as).reshape(
-                batch_size * seq_len, -1)[idx_mask].sum(-1)
+            CEM_reward_all = self.EM_pred_reward(CEM_z_as).squeeze(-1)
+            CEM_reward_out = (
+                CEM_reward_all * present_mask.float()
+            ).sum(-1).reshape(-1)[idx_mask]
             CEM_reward_loss = F.mse_loss(CEM_reward_out, target_reward)
 
             if self.args.use_rtg:
@@ -443,16 +488,27 @@ class TransformerAgent(nn.Module):
             CEM_obs_out_var = th.exp(CEM_obs_out_logvar)
 
             if self.args.use_rtg:
-                temp_mask = mask.unsqueeze(-1).expand_as(CEM_obs_out_mean)
+                temp_mask = (
+                    agent_mask.unsqueeze(-1).expand_as(CEM_obs_out_mean)
+                    * obs_feature_weight
+                )
                 masked_CEM_obs_loss = self.gauss_nll_loss(
                     CEM_obs_out_mean, target_obs, CEM_obs_out_var) * temp_mask
-                CEM_obs_loss = masked_CEM_obs_loss.sum() / temp_mask.sum()
+                CEM_obs_loss = (
+                    masked_CEM_obs_loss.sum()
+                    / temp_mask.sum().clamp_min(1.0)
+                )
             else:
-                temp_mask = mask[:,
-                                 1:].unsqueeze(-1).expand_as(target_obs[:, 1:])
+                temp_mask = (
+                    agent_mask[:, 1:].unsqueeze(-1).expand_as(target_obs[:, 1:])
+                    * obs_feature_weight[:, 1:]
+                )
                 masked_CEM_obs_loss = self.gauss_nll_loss(
                     CEM_obs_out_mean[:, :-1], target_obs[:, 1:], CEM_obs_out_var[:, :-1]) * temp_mask
-                CEM_obs_loss = masked_CEM_obs_loss.sum() / temp_mask.sum()
+                CEM_obs_loss = (
+                    masked_CEM_obs_loss.sum()
+                    / temp_mask.sum().clamp_min(1.0)
+                )
         else:
             CEM_action_loss, CEM_reward_loss, CEM_obs_loss = 0, 0, 0
 
@@ -488,8 +544,7 @@ class TransformerAgent(nn.Module):
         else:
             DEM_z_posts = th.stack(DEM_z_posts, dim=2)
 
-        DEM_action_out = self.EM_pred_actions(DEM_z_os).reshape(
-            batch_size * seq_len, -1)[idx_mask].reshape(-1, self.max_actions)
+        DEM_action_out = self.EM_pred_actions(DEM_z_os)[agent_mask]
         DEM_action_loss = F.cross_entropy(DEM_action_out, target_action)
 
         if self.args.use_rtg:
@@ -504,34 +559,42 @@ class TransformerAgent(nn.Module):
             DEM_obs_out_logvar, LOG_VAR_MIN, LOG_VAR_MAX)
         DEM_obs_out_var = th.exp(DEM_obs_out_logvar)
         if self.args.use_rtg:
-            temp_mask = mask.unsqueeze(-1).expand_as(DEM_obs_out_mean)
+            temp_mask = (
+                agent_mask.unsqueeze(-1).expand_as(DEM_obs_out_mean)
+                * obs_feature_weight
+            )
             masked_DEM_obs_loss = self.gauss_nll_loss(
                 DEM_obs_out_mean, target_obs, DEM_obs_out_var) * temp_mask
-            DEM_obs_loss = masked_DEM_obs_loss.sum() / temp_mask.sum()
+            DEM_obs_loss = (
+                masked_DEM_obs_loss.sum()
+                / temp_mask.sum().clamp_min(1.0)
+            )
         else:
-            temp_mask = mask[:, 1:].unsqueeze(-1).expand_as(target_obs[:, 1:])
+            temp_mask = (
+                agent_mask[:, 1:].unsqueeze(-1).expand_as(target_obs[:, 1:])
+                * obs_feature_weight[:, 1:]
+            )
             masked_DEM_obs_loss = self.gauss_nll_loss(
                 DEM_obs_out_mean[:, :-1], target_obs[:, 1:], DEM_obs_out_var[:, :-1]) * temp_mask
-            DEM_obs_loss = masked_DEM_obs_loss.sum() / temp_mask.sum()
+            DEM_obs_loss = (
+                masked_DEM_obs_loss.sum()
+                / temp_mask.sum().clamp_min(1.0)
+            )
 
         if self.args.train_CEM:
-            DEM_z_os = DEM_z_os.reshape(batch_size * seq_len, -1)[idx_mask]
-            DEM_z_as = DEM_z_as.reshape(batch_size * seq_len, -1)[idx_mask]
+            DEM_z_os = DEM_z_os[agent_mask]
+            DEM_z_as = DEM_z_as[agent_mask]
             if self.args.use_rtg:
-                DEM_z_rtgs = DEM_z_rtgs.reshape(
-                    batch_size * seq_len, -1)[idx_mask]
+                DEM_z_rtgs = DEM_z_rtgs[agent_mask]
             else:
-                DEM_z_posts = DEM_z_posts.reshape(
-                    batch_size * seq_len, -1)[idx_mask]
+                DEM_z_posts = DEM_z_posts[agent_mask]
 
-            CEM_z_os = CEM_z_os.reshape(batch_size * seq_len, -1)[idx_mask]
-            CEM_z_as = CEM_z_as.reshape(batch_size * seq_len, -1)[idx_mask]
+            CEM_z_os = CEM_z_os[agent_mask]
+            CEM_z_as = CEM_z_as[agent_mask]
             if self.args.use_rtg:
-                CEM_z_rtgs = CEM_z_rtgs.reshape(
-                    batch_size * seq_len, -1)[idx_mask]
+                CEM_z_rtgs = CEM_z_rtgs[agent_mask]
             else:
-                CEM_z_posts = CEM_z_posts.reshape(
-                    batch_size * seq_len, -1)[idx_mask]
+                CEM_z_posts = CEM_z_posts[agent_mask]
 
             MSE_loss1 = F.mse_loss(DEM_z_os, CEM_z_os.detach())
             MSE_loss2 = F.mse_loss(DEM_z_as, CEM_z_as.detach())

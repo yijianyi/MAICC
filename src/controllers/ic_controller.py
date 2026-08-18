@@ -33,37 +33,75 @@ class ICMAC:
         assert (test_mode == True)
         self.agent.eval()
         self._build_inputs(ep_batch, t)
+        present = self.seq_present[:, -1, 0].bool()
+        active_ids = th.nonzero(present, as_tuple=False).reshape(-1)
+        if active_ids.numel() == 0:
+            raise RuntimeError("Online action selection has no present agents")
+        active_pre = self.seq_pre[active_ids]
+        active_obs = self.seq_obs[active_ids]
+        active_action = self.seq_action[active_ids]
+        active_post = self.seq_post[active_ids]
+        for label, values in (
+            ("rtg", active_pre),
+            ("observation", active_obs),
+            ("post", active_post),
+        ):
+            if values.is_floating_point() and not bool(
+                th.isfinite(values).all().item()
+            ):
+                invalid = int((~th.isfinite(values)).sum().item())
+                raise RuntimeError(
+                    f"Non-finite active-agent {label} before DEM: "
+                    f"shape={tuple(values.shape)} invalid_values={invalid}"
+                )
         if self.args.env == "sc2v2":
-            ori_dim = self.seq_obs.shape[-1]
-            seq_smac_obs = F.pad(self.seq_obs, (0, self.input_shape - ori_dim))
+            ori_dim = active_obs.shape[-1]
+            seq_smac_obs = F.pad(active_obs, (0, self.input_shape - ori_dim))
             query_embeddings, _ = self.agent.get_dem_traj_embedding(
-                self.seq_pre, seq_smac_obs, self.seq_action.squeeze(-1), self.seq_post)
+                active_pre, seq_smac_obs, active_action.squeeze(-1), active_post)
         else:
             query_embeddings, _ = self.agent.get_dem_traj_embedding(
-                self.seq_pre, self.seq_obs, self.seq_action.squeeze(-1), self.seq_post)
+                active_pre, active_obs, active_action.squeeze(-1), active_post)
         query_embeddings = query_embeddings.cpu().numpy()
-        co, cr, ca, ct, cm = self.buffer.mips(
+        retrieval = self.buffer.mips(
             query_embeddings, t, test_mode=test_mode)
-        seq_len = co.shape[1]
-        context_rtg = th.zeros_like(cr)
-        context_rtg[:, 0] = cr.sum(1)
-        for tt in range(1, seq_len):
-            context_rtg[:, tt] = context_rtg[:, tt-1] - cr[:, tt-1]
+        if len(retrieval) == 7:
+            co, cr, ca, ct, cm, context_rtg, context_completion = retrieval
+        else:
+            co, cr, ca, ct, cm = retrieval
+            seq_len = co.shape[1]
+            context_rtg = th.zeros_like(cr)
+            context_rtg[:, 0] = cr.sum(1)
+            for tt in range(1, seq_len):
+                context_rtg[:, tt] = context_rtg[:, tt-1] - cr[:, tt-1]
+            context_ret = th.cumsum(cr, dim=1)
+            context_completion = (
+                context_ret > (self.args.max_return - 1e-1)
+            )
         context_obs = co
         context_a = ca.squeeze(-1)
-        context_ret = th.zeros_like(cr)
-        context_ret[:, 0] = cr[:, 0]
-        for tt in range(1, seq_len):
-            context_ret[:, tt] = context_ret[:, tt-1] + cr[:, tt]
-        context_completion = (context_ret > (self.args.max_return - 1e-1))
         context_post = th.cat([cr, ct, context_completion], dim=-1)
         avail_actions = ep_batch["avail_actions"][:, t]
         if self.args.env == "sc2v2":
-            agent_outs = self.agent(context_rtg, context_obs, context_a, context_post, cm,
-                                    self.seq_pre, seq_smac_obs, self.seq_action.squeeze(-1), self.seq_post)
+            active_outs = self.agent(context_rtg, context_obs, context_a, context_post, cm,
+                                     active_pre, seq_smac_obs, active_action.squeeze(-1), active_post)
         else:
-            agent_outs = self.agent(context_rtg, context_obs, context_a, context_post, cm,
-                                    self.seq_pre, self.seq_obs, self.seq_action.squeeze(-1), self.seq_post)
+            active_outs = self.agent(context_rtg, context_obs, context_a, context_post, cm,
+                                     active_pre, active_obs, active_action.squeeze(-1), active_post)
+
+        # Keep the fixed-capacity agent dimension required by EpisodeBatch,
+        # while ensuring padded/nonexistent slots never enter DEM retrieval or
+        # DT inference. Their only valid online action is IDLE.
+        agent_outs = th.full(
+            (self.n_agents, active_outs.shape[-1]),
+            -1e10,
+            dtype=active_outs.dtype,
+            device=active_outs.device,
+        )
+        agent_outs[active_ids] = active_outs
+        idle_action = int(getattr(self.agent, "idle_action_id", 7))
+        if 0 <= idle_action < agent_outs.shape[-1]:
+            agent_outs[~present, idle_action] = 0.0
 
         # Softmax the agent outputs if they're policy logits
         if self.agent_output_type == "pi_logits":
@@ -84,6 +122,7 @@ class ICMAC:
         self.seq_obs = None
         self.seq_action = None
         self.seq_post = None
+        self.seq_present = None
 
     def parameters(self):
         return self.agent.parameters()
@@ -95,8 +134,19 @@ class ICMAC:
         th.save(self.agent.state_dict(), "{}/agent.th".format(path))
 
     def load_models(self, path):
-        self.agent.load_state_dict(
-            th.load("{}/agent.th".format(path), map_location=lambda storage, loc: storage))
+        checkpoint = "{}/agent.th".format(path)
+        try:
+            state_dict = th.load(
+                checkpoint,
+                map_location=lambda storage, loc: storage,
+                weights_only=True,
+            )
+        except TypeError:
+            # PyTorch versions before weights_only was introduced.
+            state_dict = th.load(
+                checkpoint, map_location=lambda storage, loc: storage
+            )
+        self.agent.load_state_dict(state_dict)
 
     def _build_agents(self, input_shape):
         self.agent = agent_REGISTRY[self.args.agent](
@@ -104,12 +154,17 @@ class ICMAC:
 
     def _build_inputs(self, batch, t):
         if self.seq_pre is None:
+            target = float(
+                getattr(self.args, "online_target_rtg", self.args.max_return)
+            )
             rtg = th.ones(
-                self.n_agents, 1, 1, dtype=th.float32).to(batch.device) * self.args.max_return
+                self.n_agents, 1, 1, dtype=th.float32
+            ).to(batch.device) * target
             self.seq_pre = rtg
         else:
             reward = batch["reward"][:, t-1].expand(self.n_agents, 1, 1)
-            rtg = self.seq_pre[:, -1:] - reward
+            reward_scale = float(getattr(self.args, "online_return_scale", 1.0))
+            rtg = self.seq_pre[:, -1:] - reward / max(reward_scale, 1e-6)
             self.seq_pre = th.cat([self.seq_pre, rtg], dim=1)
 
         obs = batch["obs"][:, t].reshape(self.n_agents, 1, -1)
@@ -118,7 +173,13 @@ class ICMAC:
         else:
             self.seq_obs = th.cat([self.seq_obs, obs], dim=1)
 
-        action = th.zeros(self.n_agents, 1, 1).long().to(batch.device)
+        placeholder = int(
+            getattr(self.agent, "unknown_action_id", 0) or 0
+        )
+        action = th.full(
+            (self.n_agents, 1, 1), placeholder,
+            dtype=th.long, device=batch.device,
+        )
         if self.seq_action is None:
             self.seq_action = action
         else:
@@ -130,12 +191,39 @@ class ICMAC:
         else:
             self.seq_post = th.cat([self.seq_post, post], dim=1)
 
+        if "present" in batch.data.transition_data:
+            present = batch["present"][:, t].reshape(
+                self.n_agents, 1, 1
+            ).bool()
+        else:
+            present = th.ones(
+                self.n_agents, 1, 1, dtype=th.bool, device=batch.device
+            )
+        if self.seq_present is None:
+            self.seq_present = present
+        else:
+            self.seq_present = th.cat([self.seq_present, present], dim=1)
+
+        # Online episodes may last 512 steps, while every transformer was
+        # configured for a 32-step rolling history.
+        history = int(getattr(self.args, "context_length", 32))
+        self.seq_pre = self.seq_pre[:, -history:]
+        self.seq_obs = self.seq_obs[:, -history:]
+        self.seq_action = self.seq_action[:, -history:]
+        self.seq_post = self.seq_post[:, -history:]
+        self.seq_present = self.seq_present[:, -history:]
+
     def update_context(self, batch, t):
         action = batch["actions"][:, t].reshape(self.n_agents, 1, 1)
         self.seq_action[:, -1:] = action
         reward = batch["reward"][:, t].expand(self.n_agents, 1, 1)
         term = batch["terminated"][:, t].expand(self.n_agents, 1, 1)
-        completion = ((self.seq_pre[:, -1:] - reward) < 1e-2).to(th.float32)
+        if "completion" in batch.data.transition_data:
+            completion = batch["completion"][:, t].expand(
+                self.n_agents, 1, 1
+            ).float()
+        else:
+            completion = th.zeros_like(reward)
         self.seq_post[:, -1:] = th.cat([reward, term, completion], dim=-1)
 
     def _get_input_shape(self, env_info):

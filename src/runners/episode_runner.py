@@ -91,10 +91,19 @@ class EpisodeRunner:
                 self.env.render()
             episode_return += reward
 
+            stored_terminated = (
+                terminated
+                if self.args.env == "tabx"
+                else terminated != env_info.get("episode_limit", False)
+            )
             post_transition_data = {
                 "actions": actions,
-                "terminated": [(terminated != env_info.get("episode_limit", False),)],
+                "terminated": [(stored_terminated,)],
             }
+            if "completion" in self.batch.data.transition_data:
+                post_transition_data["completion"] = [
+                    (bool(env_info.get("is_win", False)),)
+                ]
             if self.args.common_reward:
                 post_transition_data["reward"] = [(reward,)]
             else:

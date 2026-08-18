@@ -125,6 +125,8 @@ def run_sequential(args, logger):
         scheme["reward"] = {"vshape": (1,)}
     else:
         scheme["reward"] = {"vshape": (args.n_agents, 1)}
+    if args.env == "tabx":
+        scheme["completion"] = {"vshape": (1,), "dtype": th.uint8}
     groups = {"agents": args.n_agents}
     preprocess = {"actions": (
         "actions_onehot", [OneHot(out_dim=args.n_actions)])}
