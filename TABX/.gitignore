@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# VS Code
+.vscode/
+
+# W&B
+wandb/
+
+# jupyter notebook
+*.ipynb
+
+# Saves
+ckpt/
+save/
+ckpt*/
+
+# Output files
+*.csv
+*.txt
+*.pkl
+*.npy
+*.npz
+*.gif
