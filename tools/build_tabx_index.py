@@ -113,12 +113,15 @@ def main() -> int:
     retrieval = dict(config.get("retrieval", {}))
     training = dict(config.get("training", {}))
     manifest = TabxManifest(Path(str(data["manifest"])))
+    normalization_manifest = Path(
+        str(data.get("normalization_manifest", data["manifest"]))
+    )
     normalization = ObservationNormalizer.load(
         Path(str(data["normalization"])),
         manifest.obs_dim,
         clip=float(data.get("normalization_clip", 10.0)),
         preserve_zeros=bool(data.get("preserve_zero_padding", True)),
-        manifest_path=manifest.path,
+        manifest_path=normalization_manifest,
     )
     device = select_device(str(training.get("device", "auto")))
     _args, mac, _learner, _logger = create_model_and_learner(

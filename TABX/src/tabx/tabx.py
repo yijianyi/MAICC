@@ -9,6 +9,7 @@ from src.tabx.config import TABXConfig
 from src.tabx.constants import ACTION_TABLE, AttackType, UnitAction
 from src.tabx.environments.base_maenv import BaseMAEnv
 from src.tabx.environments.spaces import Box, Discrete
+from src.tabx.outcome import did_ally_win
 from src.tabx.physics.components import (
     CircleCollider,
     Ellipse,
@@ -289,14 +290,31 @@ class ParsedState:
     @classmethod
     def from_state(cls, state, keys) -> "ParsedState":
         healths = jnp.stack([state[unit].status.health for unit in keys])
-        max_healths = healths / jnp.stack([state[unit].status.max_health for unit in keys])
+        raw_max_healths = jnp.stack(
+            [state[unit].status.max_health for unit in keys]
+        )
+        safe_max_healths = jnp.where(raw_max_healths > 0, raw_max_healths, 1.0)
+        max_healths = jnp.where(
+            raw_max_healths > 0, healths / safe_max_healths, 0.0
+        )
         positions = jnp.stack([state[unit].transform.position for unit in keys])
         rotations = jnp.stack([state[unit].transform.rotation for unit in keys]) / (jnp.pi * 2)
         attack_ranges = jnp.stack([state[unit].status.attack_range for unit in keys])
         attack_damages = jnp.stack([state[unit].status.attack_damage for unit in keys])
         cooldowns = jnp.stack([state[unit].status.cooldown for unit in keys])
-        attack_cooldowns = cooldowns / jnp.stack(
+        raw_attack_cooldowns = jnp.stack(
             [state[unit].status.attack_cooldown for unit in keys]
+        )
+        safe_attack_cooldowns = jnp.where(
+            raw_attack_cooldowns > 0, raw_attack_cooldowns, 1.0
+        )
+        # A real unit with a zero cooldown is always ready; a padded unit has
+        # max_health==0 and must retain the all-zero observation convention.
+        zero_cooldown_ratio = jnp.where(raw_max_healths > 0, 1.0, 0.0)
+        attack_cooldowns = jnp.where(
+            raw_attack_cooldowns > 0,
+            cooldowns / safe_attack_cooldowns,
+            zero_cooldown_ratio,
         )
 
         body_radiuss = jnp.stack([state[unit].collider.radius for unit in keys])
@@ -668,28 +686,28 @@ class TABX(BaseMAEnv):
             axis=1,
         )
 
-        other_feature = (
-            jnp.concatenate(
-                (
-                    rolled_health,
-                    rolled_max_health,
-                    rolled_distnace_matrix,
-                    rolled_rotation,
-                    rolled_attack_range,
-                    rolled_attack_damage,
-                    rolled_cooldown,
-                    rolled_attack_cooldown,
-                    rolled_radius,
-                    rolled_mass,
-                    rolled_sight_angle,
-                    rolled_is_alive,
-                    rolled_is_ally,
-                    rolled_attackable_matrix,
-                    rolled_speed,
-                ),
-                axis=2,
-            )
-            * rolled_visible_matrix
+        other_feature = jnp.concatenate(
+            (
+                rolled_health,
+                rolled_max_health,
+                rolled_distnace_matrix,
+                rolled_rotation,
+                rolled_attack_range,
+                rolled_attack_damage,
+                rolled_cooldown,
+                rolled_attack_cooldown,
+                rolled_radius,
+                rolled_mass,
+                rolled_sight_angle,
+                rolled_is_alive,
+                rolled_is_ally,
+                rolled_attackable_matrix,
+                rolled_speed,
+            ),
+            axis=2,
+        )
+        other_feature = jnp.where(
+            rolled_visible_matrix, other_feature, 0.0
         ).reshape(n_unit, -1)
         if self.max_n_zone > 0:
             zone_types = jnp.stack([state[zone].zone_type for zone in self.zone_keys])
@@ -875,7 +893,6 @@ class TABX(BaseMAEnv):
     def step(self, key, env_state, actions):
         state = env_state["state"]
         physics_params = env_state["physics_params"]
-        parsed_state: ParsedState = state["game_manager"].parsed_state
 
         for sprite in state.keys():
             if hasattr(state[sprite], "update"):
@@ -913,9 +930,13 @@ class TABX(BaseMAEnv):
                 jnp.logical_not(state[sprite].status.is_alive) | state[sprite].status.is_disabled
             )
 
-        is_alives = parsed_state.is_alives
-        teams = parsed_state.teams
-        is_disabled = parsed_state.is_disabled
+        # Use the post-action state so an elimination ends the episode on the
+        # step where it happens rather than one step later.
+        is_alives = jnp.stack([state[unit].status.is_alive for unit in self.unit_keys])
+        teams = jnp.stack([state[unit].team for unit in self.unit_keys])
+        is_disabled = jnp.stack(
+            [state[unit].status.is_disabled for unit in self.unit_keys]
+        )
 
         def is_team_done(team):
             return ((teams == team) & (~is_alives | is_disabled)).sum() == (teams == team).sum()
@@ -942,11 +963,16 @@ class TABX(BaseMAEnv):
         delta_hp = team_hp_ratio - state["game_manager"].last_team_hp_ratio
         reward_matrix = (jnp.identity(self.max_team) - 0.5) * 2.0
 
-        # The team with the highest hp ratio gets reward 1.0 when the episode is done or truncated
-        decision_win_reward = (
-            jnp.full_like(team_hp_ratio, self.lose_reward)
-            .at[self.max_team - 1 - jnp.argmax(jnp.round(team_hp_ratio[::-1], 4))]
-            .set(self.win_reward)
+        # Team 0 wins only by eliminating team 1 before timeout. Every other
+        # terminal outcome is a team-0 loss, so a finished episode has exactly
+        # one winner and never a draw.
+        ally_win = did_ally_win(team_dones, truncation)
+        team_winners = (
+            jnp.stack([ally_win, ~ally_win])
+            & jnp.asarray(dones["__all__"]).reshape()
+        )
+        decision_win_reward = jnp.where(
+            team_winners, self.win_reward, self.lose_reward
         )
         win_reward = jnp.where(dones["__all__"], decision_win_reward, 0.0)[..., None]
         # dense reward
@@ -961,7 +987,7 @@ class TABX(BaseMAEnv):
             "timestep": state["game_manager"].timestep,
             "disabled_units": is_disabled,
             "done_reward": win_reward,
-            "is_win": jnp.where(win_reward == self.win_reward, 1.0, 0.0),
+            "is_win": team_winners.astype(jnp.float32)[..., None],
             "truncation": truncation,
             "is_attacking": is_attacking,
             "damage_dealt": damage_dealt,

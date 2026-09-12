@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import sys
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -36,9 +37,81 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-rows", type=int, default=8)
     parser.add_argument("--sample-probability", type=float, default=0.0005)
     parser.add_argument("--max-samples", type=int, default=150000)
+    parser.add_argument(
+        "--max-enemies",
+        type=int,
+        default=None,
+        help=(
+            "Enemy slot capacity used to decode the flattened observation. "
+            "Defaults to manifest.max_agents, matching the symmetric TABX "
+            "10v10/20v20 schemas."
+        ),
+    )
+    parser.add_argument(
+        "--n-zones",
+        type=int,
+        default=None,
+        help=(
+            "Optional zone-slot contract. The value is inferred from obs_dim "
+            "and unit capacities when omitted."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def infer_observation_layout(
+    obs_dim: int,
+    max_allies: int,
+    max_enemies: Optional[int] = None,
+    expected_zones: Optional[int] = None,
+) -> Tuple[int, int, int]:
+    """Return (other-unit blocks, zone slots, enemy capacity)."""
+    own_feature_dim = 14
+    other_unit_feature_dim = 16
+    zone_feature_dim = 6
+    enemy_capacity = max_allies if max_enemies is None else int(max_enemies)
+    if max_allies <= 0 or enemy_capacity <= 0:
+        raise ValueError("TABX ally/enemy capacities must be positive")
+    other_blocks = int(max_allies) + enemy_capacity - 1
+    zone_width = int(obs_dim) - (
+        own_feature_dim + other_blocks * other_unit_feature_dim
+    )
+    if zone_width < 0 or zone_width % zone_feature_dim:
+        raise ValueError(
+            "Cannot decode TABX observation layout: "
+            f"obs_dim={obs_dim}, max_allies={max_allies}, "
+            f"max_enemies={enemy_capacity}, remaining_zone_width={zone_width}"
+        )
+    zone_slots = zone_width // zone_feature_dim
+    if expected_zones is not None and zone_slots != int(expected_zones):
+        raise ValueError(
+            f"Observation implies {zone_slots} zone slots, expected "
+            f"{int(expected_zones)}"
+        )
+    return other_blocks, zone_slots, enemy_capacity
+
+
+def update_reservoir(
+    reservoir: np.ndarray,
+    sample_count: int,
+    candidate_count: int,
+    candidates: np.ndarray,
+    rng: np.random.Generator,
+) -> Tuple[int, int]:
+    """Uniformly retain at most reservoir.shape[0] candidate rows."""
+    capacity = int(reservoir.shape[0])
+    for row in candidates:
+        candidate_count += 1
+        if sample_count < capacity:
+            reservoir[sample_count] = row
+            sample_count += 1
+            continue
+        replacement = int(rng.integers(0, candidate_count))
+        if replacement < capacity:
+            reservoir[replacement] = row
+    return sample_count, candidate_count
 
 
 def main() -> int:
@@ -61,6 +134,7 @@ def main() -> int:
         (cli.max_samples, manifest.obs_dim), dtype=np.float32
     )
     sample_count = 0
+    candidate_count = 0
     count = 0
     for task in manifest.tasks_for_split(cli.split):
         with h5py.File(str(task.h5_path), "r") as handle:
@@ -81,15 +155,14 @@ def main() -> int:
                     chosen = values[
                         rng.random(values.shape[0]) < cli.sample_probability
                     ]
-                    remaining = cli.max_samples - sample_count
-                    if chosen.shape[0] > remaining:
-                        raise SystemExit(
-                            "Normalization sample reservoir is full. Rerun with "
-                            "a smaller --sample-probability or larger --max-samples."
-                        )
                     if chosen.size:
-                        samples[sample_count : sample_count + chosen.shape[0]] = chosen
-                        sample_count += chosen.shape[0]
+                        sample_count, candidate_count = update_reservoir(
+                            samples,
+                            sample_count,
+                            candidate_count,
+                            chosen,
+                            rng,
+                        )
                     count += int(values.shape[0])
         print(
             f"[normalization] task={task.task_id} count={count}", flush=True
@@ -108,10 +181,19 @@ def main() -> int:
         if nonzero.size:
             scale[feature] = np.percentile(nonzero, 99)
 
-    # TABX schema: own[14], (all units except self)*other[16], zones[4]*6.
+    try:
+        other_blocks, n_zones, max_enemies = infer_observation_layout(
+            manifest.obs_dim,
+            manifest.max_agents,
+            cli.max_enemies,
+            cli.n_zones,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    # TABX schema: own[14], (all units except self)*other[16], zones*N*6.
     # These dimensions are already ratios, binary flags or categorical codes.
     semantic_unit_scale_one = {1, 4, 11, 12}
-    other_blocks = (manifest.obs_dim - 14 - 4 * 6) // 16
     for index in semantic_unit_scale_one:
         scale[index] = 1.0
     for block in range(max(0, other_blocks)):
@@ -119,7 +201,7 @@ def main() -> int:
         for index in (1, 4, 8, 11, 12, 13, 14):
             scale[offset + index] = 1.0
     zone_start = 14 + max(0, other_blocks) * 16
-    for zone in range(4):
+    for zone in range(n_zones):
         # zone_type and effect/type marker are categorical/indicator fields.
         scale[zone_start + zone * 6] = 1.0
         scale[zone_start + zone * 6 + 5] = 1.0
@@ -136,6 +218,7 @@ def main() -> int:
         statistic=np.asarray("global_random_sample_abs_p99"),
         count=np.asarray(count, dtype=np.int64),
         sample_count=np.asarray(sample_count, dtype=np.int64),
+        candidate_count=np.asarray(candidate_count, dtype=np.int64),
         sample_probability=np.asarray(cli.sample_probability, dtype=np.float64),
         seed=np.asarray(cli.seed, dtype=np.int64),
         schema_version=np.asarray("tabx_obs_normalizer_v2"),
@@ -144,10 +227,14 @@ def main() -> int:
         ),
         obs_dim=np.asarray(manifest.obs_dim, dtype=np.int64),
         max_agents=np.asarray(manifest.max_agents, dtype=np.int64),
+        max_enemies=np.asarray(max_enemies, dtype=np.int64),
+        n_zones=np.asarray(n_zones, dtype=np.int64),
+        other_unit_blocks=np.asarray(other_blocks, dtype=np.int64),
         sequence_length=np.asarray(manifest.sequence_length, dtype=np.int64),
     )
     print(
-        f"Wrote {output}; count={count} samples={sample_count} "
+        f"Wrote {output}; count={count} candidates={candidate_count} "
+        f"samples={sample_count} zones={n_zones} "
         f"scale_range=[{scale.min():.6g}, {scale.max():.6g}]"
     )
     return 0

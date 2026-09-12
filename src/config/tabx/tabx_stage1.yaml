@@ -1,6 +1,6 @@
 data:
-  manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/manifest.json
-  normalization: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/obs_normalization.npz
+  manifest: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/manifest.json
+  normalization: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/obs_normalization.npz
   h5_lru_size: 16
   normalization_clip: 10.0
   preserve_zero_padding: true
@@ -25,7 +25,10 @@ training:
   device: auto
   seed: 7
   total_steps: 100000
-  max_batch_size: 4
+  # DT receives 4 * (k + 1) * 100 = 1200 tokens at full history when k=2.
+  # Keep the initial production batch conservative; increase only after a
+  # measured memory smoke test on the target GPU.
+  max_batch_size: 32
   agent_time_budget: 4096
   learning_rate: 0.0005
   grad_norm_clip: 10.0
@@ -37,12 +40,12 @@ training:
   metrics_interval: 1
   metrics_file: training_metrics.csv
   save_interval: 10000
-  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage1
+  output_dir: /mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_stage1
 
 retrieval:
   k: 2
   search_k: 128
-  # HNSW performs random graph reads. Loading these ~2.5 GiB indexes into RAM
+  # HNSW performs random graph reads. Loading these multi-GiB indexes into RAM
   # avoids pathological page faults when the files live on /mnt/cfs.
   index_load_mode: ram
   faiss_threads: 4
@@ -53,12 +56,12 @@ retrieval:
   # adaptively if two source-diverse contexts are not found.
   online_search_k: 16
   max_similarity: 0.98
-  history_buckets: [1, 4, 8, 16, 32]
+  history_buckets: [1, 4, 8, 16, 32, 64, 100]
   index_factory: HNSW32,Flat
   index_batch_rows: 8
   # 0 indexes all rows. Set a positive cap only for a smoke test; selected
   # rows are then spread evenly across each task.
   max_index_rows_per_task: 0
-  stage0_checkpoint: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage0/step_000100000
-  index_dir: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval
-  index_manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval/retrieval_manifest.json
+  stage0_checkpoint: /mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_stage0/step_000100000
+  index_dir: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/retrieval
+  index_manifest: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/retrieval/retrieval_manifest.json

@@ -12,14 +12,21 @@ GPU_ID="${GPU_ID:-1}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-7}"
 EPISODES="${EPISODES:-1000}"
 EPISODE_LIMIT="${EPISODE_LIMIT:-512}"
-BASE_SEED="${BASE_SEED:-20000}"
+BASE_SEED="${BASE_SEED:-0}"
+SEED_STRIDE="${SEED_STRIDE:-1}"
+MAX_ALLIES="${MAX_ALLIES:-10}"
+MAX_ENEMIES="${MAX_ENEMIES:-10}"
+MAX_ZONES="${MAX_ZONES:-4}"
+# 0 keeps MAICC test-time online memory enabled. Set to 1 to evaluate with
+# only the prebuilt offline retrieval memory.
+DISABLE_ONLINE_MEMORY="${DISABLE_ONLINE_MEMORY:-0}"
 
 PYTHON_BIN="${PYTHON_BIN:-/mnt/cfs/shaopt/conda_envs/MAICC_TABX/bin/python}"
 CONFIG="${CONFIG:-src/config/tabx/tabx_stage1.yaml}"
-CHECKPOINT="${CHECKPOINT:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0803_7task_stage1/step_000100000}"
+CHECKPOINT="${CHECKPOINT:-/mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_l100_stage1/step_000100000}"
 RAW_DATA_ROOT="${RAW_DATA_ROOT:-/mnt/cfs/shaopt/data/MARL/0803_overfit_7task_train_7000record_balance_winrate}"
-MANIFEST="${MANIFEST:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0803_7task_l32/manifest.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0803_all7_parallel_1000}"
+MANIFEST="${MANIFEST:-/mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l100/manifest.json}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/cfs/shaopt/data/MARL/maicc_results/0803_all7_parallel_1000_l100}"
 
 # CPU threads used by each of the seven evaluator processes. FAISS has its own
 # `faiss_threads` setting under `retrieval` in CONFIG.
@@ -42,8 +49,14 @@ is_positive_integer "$PARALLEL_JOBS" || die "PARALLEL_JOBS must be positive"
 is_positive_integer "$EPISODES" || die "EPISODES must be positive"
 is_positive_integer "$EPISODE_LIMIT" || die "EPISODE_LIMIT must be positive"
 is_nonnegative_integer "$BASE_SEED" || die "BASE_SEED must be non-negative"
+is_positive_integer "$SEED_STRIDE" || die "SEED_STRIDE must be positive"
+is_positive_integer "$MAX_ALLIES" || die "MAX_ALLIES must be positive"
+is_positive_integer "$MAX_ENEMIES" || die "MAX_ENEMIES must be positive"
+is_nonnegative_integer "$MAX_ZONES" || die "MAX_ZONES must be non-negative"
 is_positive_integer "$CPU_THREADS_PER_JOB" || \
   die "CPU_THREADS_PER_JOB must be positive"
+[[ "$DISABLE_ONLINE_MEMORY" == "0" || "$DISABLE_ONLINE_MEMORY" == "1" ]] || \
+  die "DISABLE_ONLINE_MEMORY must be 0 or 1"
 
 [[ -x "$PYTHON_BIN" ]] || die "Python is not executable: $PYTHON_BIN"
 [[ -f "$CONFIG" ]] || die "Config does not exist: $CONFIG"
@@ -52,6 +65,11 @@ is_positive_integer "$CPU_THREADS_PER_JOB" || \
 [[ -f "$MANIFEST" ]] || die "Manifest does not exist: $MANIFEST"
 
 mkdir -p "$OUTPUT_ROOT"
+
+EVAL_MEMORY_ARGS=()
+if [[ "$DISABLE_ONLINE_MEMORY" == "1" ]]; then
+  EVAL_MEMORY_ARGS+=(--disable-online-memory)
+fi
 
 mapfile -t TASK_IDS < <(
   "$PYTHON_BIN" - "$MANIFEST" <<'PY'
@@ -81,6 +99,9 @@ cat <<EOF
 [parallel-eval] gpu=$GPU_ID
 [parallel-eval] tasks=$TASK_COUNT parallel_jobs=$PARALLEL_JOBS
 [parallel-eval] episodes_per_task=$EPISODES episode_limit=$EPISODE_LIMIT
+[parallel-eval] base_seed=$BASE_SEED seed_stride=$SEED_STRIDE
+[parallel-eval] capacities=${MAX_ALLIES}v${MAX_ENEMIES} zones=$MAX_ZONES
+[parallel-eval] dynamic_online_memory=$((1 - DISABLE_ONLINE_MEMORY))
 [parallel-eval] checkpoint=$CHECKPOINT
 [parallel-eval] output_root=$OUTPUT_ROOT
 EOF
@@ -121,7 +142,8 @@ for ((batch_start = 0; batch_start < TASK_COUNT; batch_start += PARALLEL_JOBS));
     fi
 
     task_id="${TASK_IDS[$task_index]}"
-    task_seed=$((BASE_SEED + task_index * EPISODES))
+    # Every task/scenario starts from the same base seed.
+    task_seed="$BASE_SEED"
     task_output="$OUTPUT_ROOT/$task_id"
     task_log="$task_output/eval.log"
     mkdir -p "$task_output"
@@ -142,9 +164,14 @@ for ((batch_start = 0; batch_start < TASK_COUNT; batch_start += PARALLEL_JOBS));
         --task-id "$task_id" \
         --episodes "$EPISODES" \
         --episode-limit "$EPISODE_LIMIT" \
+        --max-allies "$MAX_ALLIES" \
+        --max-enemies "$MAX_ENEMIES" \
+        --max-zones "$MAX_ZONES" \
         --seed "$task_seed" \
+        --seed-stride "$SEED_STRIDE" \
         --raw-data-root "$RAW_DATA_ROOT" \
         --output-dir "$task_output" \
+        "${EVAL_MEMORY_ARGS[@]}" \
         --resume \
         >"$task_log" 2>&1 &
 
@@ -178,6 +205,7 @@ AGGREGATE_STATUS=0
 import csv
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 output_root = Path(sys.argv[1])
@@ -187,6 +215,8 @@ expected_episodes = int(sys.argv[3])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 task_ids = [str(task["task_id"]) for task in manifest["tasks"]]
 rows = []
+episode_rows = []
+episode_fields = None
 missing = []
 
 for task_id in task_ids:
@@ -202,7 +232,26 @@ for task_id in task_ids:
     if len(matches) != 1 or int(matches[0].get("episodes", -1)) != expected_episodes:
         missing.append(task_id)
         continue
+    episodes_path = output_root / task_id / "episodes.csv"
+    if not episodes_path.is_file():
+        missing.append(task_id)
+        continue
+    with episodes_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        current_fields = list(reader.fieldnames or [])
+        current_rows = list(reader)
+    if len(current_rows) != expected_episodes:
+        missing.append(task_id)
+        continue
+    if episode_fields is None:
+        episode_fields = current_fields
+    elif current_fields != episode_fields:
+        raise SystemExit(
+            f"Episode CSV schemas differ: {episodes_path} has {current_fields}, "
+            f"expected {episode_fields}"
+        )
     rows.append(matches[0])
+    episode_rows.extend(current_rows)
 
 fieldnames = [
     "task_id",
@@ -211,10 +260,13 @@ fieldnames = [
     "episodes",
     "seed_start",
     "seed_end",
+    "seed_stride",
     "wins",
+    "losses",
     "win_rate",
     "mean_return",
     "mean_length",
+    "result_sequence",
     "task_package",
 ]
 csv_path = output_root / "summary.csv"
@@ -223,8 +275,48 @@ with csv_path.open("w", newline="", encoding="utf-8") as handle:
     writer.writeheader()
     writer.writerows(rows)
 
+combined_episodes_path = output_root / "episodes.csv"
+if episode_fields:
+    with combined_episodes_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=episode_fields)
+        writer.writeheader()
+        writer.writerows(episode_rows)
+
+by_episode = defaultdict(list)
+for row in episode_rows:
+    by_episode[int(row["episode"])].append(row)
+
+episode_summary_fields = [
+    "episode", "tasks", "wins", "losses", "win_rate", "mean_return",
+    "mean_length", "seed_min", "seed_max",
+]
+episode_summary_rows = []
+for episode, grouped_rows in sorted(by_episode.items()):
+    wins = sum(int(row["win"]) for row in grouped_rows)
+    count = len(grouped_rows)
+    seeds = [int(row["seed"]) for row in grouped_rows]
+    episode_summary_rows.append(
+        {
+            "episode": episode,
+            "tasks": count,
+            "wins": wins,
+            "losses": count - wins,
+            "win_rate": wins / count,
+            "mean_return": sum(float(row["return"]) for row in grouped_rows) / count,
+            "mean_length": sum(int(row["length"]) for row in grouped_rows) / count,
+            "seed_min": min(seeds),
+            "seed_max": max(seeds),
+        }
+    )
+episode_summary_path = output_root / "episode_summary.csv"
+with episode_summary_path.open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=episode_summary_fields)
+    writer.writeheader()
+    writer.writerows(episode_summary_rows)
+
 total_episodes = sum(int(row["episodes"]) for row in rows)
 total_wins = sum(int(row["wins"]) for row in rows)
+total_losses = total_episodes - total_wins
 aggregate = {
     "status": "complete" if not missing else "incomplete",
     "requested_tasks": len(task_ids),
@@ -232,6 +324,7 @@ aggregate = {
     "episodes_per_task": expected_episodes,
     "total_episodes": total_episodes,
     "total_wins": total_wins,
+    "total_losses": total_losses,
     "overall_win_rate": (
         total_wins / total_episodes if total_episodes else 0.0
     ),
@@ -240,6 +333,8 @@ aggregate = {
         if rows else 0.0
     ),
     "missing_tasks": missing,
+    "episode_results_file": str(combined_episodes_path),
+    "episode_summary_file": str(episode_summary_path),
     "tasks": rows,
 }
 json_path = output_root / "summary.json"
@@ -250,6 +345,8 @@ json_path.write_text(
 
 print(json.dumps(aggregate, indent=2, ensure_ascii=False))
 print(f"Wrote combined CSV: {csv_path}")
+print(f"Wrote combined episode results: {combined_episodes_path}")
+print(f"Wrote per-episode summary: {episode_summary_path}")
 print(f"Wrote combined JSON: {json_path}")
 
 if missing:

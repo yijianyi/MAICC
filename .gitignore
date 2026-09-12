@@ -29,6 +29,3 @@ tmp/
 
 # Vendored TABX demo media (not needed for training)
 TABX/imgs/
-
-# Local training datasets
-/datasets/

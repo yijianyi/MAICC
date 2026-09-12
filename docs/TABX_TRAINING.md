@@ -20,7 +20,7 @@ converted, normalized and trained again.
   `reward_individual` are ignored.
 - `terminated=done`, including a timeout loss. `truncation` is diagnostic.
 - `completion=is_win`.
-- Raw RTG is computed to the end of the complete source episode before 32-step
+- Raw RTG is computed to the end of the complete source episode before 100-step
   windows are cut. The loader divides it by each task's P95 absolute episode
   return; online code must load the same fixed scale.
 - Real dead agents remain present and keep their MAICC action targets.
@@ -62,15 +62,14 @@ scale 1, and estimates P99 absolute scale for remaining continuous features.
 - `encoder_use_rtg=false`: CEM and DEM tokens are obs/action/post.
 - `policy_use_rtg=true`: DT retains the original MAICC
   RTG/obs/action/post token order.
-- Context length is 32; converted `EpisodeBatch` length is 33; TABX online
+- Context length is 100; converted `EpisodeBatch` length is 101; TABX online
   episode limit remains 512.
 - Stage 0 trains CEM/DEM. Stage 1 freezes every encoder parameter and creates a
   DT-only optimizer, keeping the prebuilt FAISS space stationary.
 - Retrieval keys are per `(window, agent)`, as in MAICC. Padding agents do not
   enter the index.
-- The full-history bucket uses every non-overlapping 32-step window. Early
-  buckets 1/4/8/16 use only true episode-start windows to avoid multiplying the
-  index fivefold.
+- The full-history bucket uses every stride-50 100-step window. Early buckets
+  1/4/8/16/32/64 use only true episode-start windows to limit index growth.
 - Training queries exclude every candidate from the same source `record`, then
   search adaptively from 128 up to 4096 candidates. Different source records
   are preferred for `k=2`; diversity is relaxed only if necessary.
@@ -92,10 +91,12 @@ normalizer/index/checkpoint, and enables MAICC-style online memory:
 ```bash
 python tools/eval_tabx_online.py \
   --config src/config/tabx/tabx_stage1.yaml \
-  --checkpoint /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage1/step_000100000 \
+  --checkpoint /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_l100_stage1/step_000100000 \
   --task-id TASK_ID_FROM_MANIFEST \
-  --scenario TABX_SCENARIO_NAME \
-  --episodes 100
+  --episodes 100 \
+  --seed 0 \
+  --seed-stride 1 \
+  --output-dir /mnt/cfs/shaopt/data/MARL/maicc_results/online_seed_0
 ```
 
 Online memory starts empty, adds an episode only after terminal, never updates
@@ -103,6 +104,15 @@ model weights, and uses no individual reward or state. The probability of
 choosing offline memory decays exponentially from 1 toward 0.01; pass
 `--disable-online-memory` for the reproducible offline-only ablation. Every
 independent evaluator process starts with an empty online memory.
+
+`--seed` is the first episode seed for every task/scenario and episode `i` uses
+`seed + (i - 1) * seed_stride`. Thus the defaults make every scenario use the
+same sequence `0, 1, 2, ...`. Each completed episode is printed as an explicit
+`WIN` or `LOSS` and appended to `episodes.csv`; `summary.csv` and `summary.json`
+contain wins, losses, win rate, and the `W`/`L` result sequence.
+When using `tools/eval_tabx_all_tasks_parallel.sh`, set `BASE_SEED` and
+`SEED_STRIDE` in the environment. The launcher additionally writes a merged
+`episodes.csv` and `episode_summary.csv` under `OUTPUT_ROOT`.
 
 For 20v20 formal training, use a new output directory and configs with
 `model.max_agents: 20`; set `MAX_ALLIES=20 MAX_ENEMIES=20 OBS_DIM=662` when

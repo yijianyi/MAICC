@@ -23,6 +23,7 @@ class TabxOnlineWrapper:
         self.env_params = env_params
         self.seed = int(seed)
         self.episode_index = 0
+        self.current_episode_seed = None
         self._rng = None
         self.state = None
         self._obs = None
@@ -38,10 +39,16 @@ class TabxOnlineWrapper:
     def _numpy(value: Any) -> np.ndarray:
         return np.asarray(value)
 
-    def _reset_key(self):
+    def _reset_key(self, seed: int | None = None):
         import jax
 
-        self._rng = jax.random.PRNGKey(self.seed + self.episode_index)
+        episode_seed = (
+            self.seed + self.episode_index if seed is None else int(seed)
+        )
+        if episode_seed < 0:
+            raise ValueError(f"Episode seed must be non-negative, got {episode_seed}")
+        self.current_episode_seed = episode_seed
+        self._rng = jax.random.PRNGKey(episode_seed)
         self.episode_index += 1
         self._rng, key = jax.random.split(self._rng)
         return key
@@ -73,9 +80,10 @@ class TabxOnlineWrapper:
             values.append(float(maximum) > 0.0)
         return np.asarray(values, dtype=bool)
 
-    def reset(self):
+    def reset(self, seed: int | None = None):
+        """Reset with an explicit seed, or use ``base_seed + episode_index``."""
         observations, self.state = self.env.reset(
-            self._reset_key(), self.env_params
+            self._reset_key(seed), self.env_params
         )
         self.present = self._detect_present()
         self._obs = self._stack_obs(observations)

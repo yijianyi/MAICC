@@ -204,8 +204,8 @@ class ICMAC:
         else:
             self.seq_present = th.cat([self.seq_present, present], dim=1)
 
-        # Online episodes may last 512 steps, while every transformer was
-        # configured for a 32-step rolling history.
+        # Online episodes may be longer than the transformer training window.
+        # Keep exactly the manifest-configured rolling history at inference.
         history = int(getattr(self.args, "context_length", 32))
         self.seq_pre = self.seq_pre[:, -history:]
         self.seq_obs = self.seq_obs[:, -history:]

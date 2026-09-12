@@ -4,8 +4,8 @@
 # /mnt/cfs/shaopt/data/MARL/0803_overfit_7task_train_7000record_balance_winrate
 
 data:
-  manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/manifest.json
-  normalization: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/obs_normalization.npz
+  manifest: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/manifest.json
+  normalization: /mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100/obs_normalization.npz
   h5_lru_size: 16
   normalization_clip: 10.0
   preserve_zero_padding: true
@@ -31,7 +31,9 @@ training:
   device: auto
   seed: 7
   total_steps: 100000
-  max_batch_size: 4
+  # L=100 raises temporal-attention cost by roughly (100 / 32)^2. Start with
+  # one converted window per optimization batch to avoid GPU OOM.
+  max_batch_size: 32
   agent_time_budget: 4096
   learning_rate: 0.0005
   grad_norm_clip: 10.0
@@ -44,7 +46,7 @@ training:
   metrics_interval: 1
   metrics_file: training_metrics.csv
   save_interval: 10000
-  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage0
+  output_dir: /mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_stage0
 
 retrieval:
   k: 2

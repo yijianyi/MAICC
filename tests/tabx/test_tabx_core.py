@@ -27,6 +27,10 @@ from tools.convert_tabx_to_maicc import (
     build_windows,
     discover_record_dirs,
 )
+from tools.compute_tabx_normalization import (
+    infer_observation_layout,
+    update_reservoir,
+)
 from tools.scan_tabx_dataset import infer_record_shape_metadata
 
 
@@ -62,6 +66,31 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(manifest.action_dim, 8)
             self.assertEqual(manifest.max_agents, 20)
             self.assertEqual(len(manifest.tasks_for_split("train")), 1)
+
+
+class NormalizationSchemaTests(unittest.TestCase):
+    def test_infers_four_and_ten_zone_observation_layouts(self) -> None:
+        self.assertEqual(infer_observation_layout(342, 10), (19, 4, 10))
+        self.assertEqual(infer_observation_layout(378, 10), (19, 10, 10))
+        self.assertEqual(infer_observation_layout(662, 20), (39, 4, 20))
+
+    def test_rejects_wrong_zone_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "implies 10 zone slots"):
+            infer_observation_layout(378, 10, expected_zones=4)
+
+    def test_full_reservoir_continues_sampling(self) -> None:
+        reservoir = np.empty((5, 2), dtype=np.float32)
+        candidates = np.arange(40, dtype=np.float32).reshape(20, 2)
+        sample_count, candidate_count = update_reservoir(
+            reservoir,
+            sample_count=0,
+            candidate_count=0,
+            candidates=candidates,
+            rng=np.random.default_rng(7),
+        )
+        self.assertEqual(sample_count, 5)
+        self.assertEqual(candidate_count, 20)
+        self.assertTrue(np.isfinite(reservoir).all())
 
     def test_rejects_cross_task_obs_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

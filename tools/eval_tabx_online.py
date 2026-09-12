@@ -41,6 +41,14 @@ DEFAULT_RAW_DATA = Path(
     "0803_overfit_7task_train_7000record_balance_winrate"
 )
 
+EPISODE_FIELDS = (
+    "task_id", "episode", "seed", "result", "win", "loss", "return",
+    "length", "cumulative_wins", "cumulative_losses", "running_win_rate",
+)
+LEGACY_EPISODE_FIELDS = (
+    "task_id", "episode", "seed", "win", "return", "length",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -59,7 +67,14 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate only this manifest task. Repeatable; default is all tasks.",
     )
     parser.add_argument("--episodes", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=10000)
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="First episode seed for every task/scenario (default: 0).",
+    )
+    parser.add_argument(
+        "--seed-stride", type=int, default=1,
+        help="Difference between consecutive episode seeds (default: 1).",
+    )
     parser.add_argument("--tabx-root", type=Path, default=REPO_ROOT / "TABX")
     parser.add_argument("--raw-data-root", type=Path, default=DEFAULT_RAW_DATA)
     parser.add_argument(
@@ -243,11 +258,12 @@ def append_episode(
     win: bool,
     episode_return: float,
     length: int,
+    cumulative_wins: int,
+    cumulative_losses: int,
 ) -> None:
-    fields = ("task_id", "episode", "seed", "win", "return", "length")
     write_header = not path.is_file() or path.stat().st_size == 0
     with path.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=EPISODE_FIELDS)
         if write_header:
             writer.writeheader()
         writer.writerow(
@@ -255,9 +271,14 @@ def append_episode(
                 "task_id": task_id,
                 "episode": episode,
                 "seed": seed,
+                "result": "WIN" if win else "LOSS",
                 "win": int(win),
+                "loss": int(not win),
                 "return": f"{episode_return:.9g}",
                 "length": length,
+                "cumulative_wins": cumulative_wins,
+                "cumulative_losses": cumulative_losses,
+                "running_win_rate": f"{cumulative_wins / episode:.9g}",
             }
         )
         handle.flush()
@@ -300,6 +321,7 @@ def evaluate_task(
     device: str,
     episodes: int,
     seed_start: int,
+    seed_stride: int,
     episode_csv: Path,
 ) -> Dict[str, Any]:
     import torch as th
@@ -337,10 +359,17 @@ def evaluate_task(
     episode_returns = []
     lengths = []
     for episode in range(episodes):
-        raw_obs = env.reset()
+        episode_seed = seed_start + episode * seed_stride
+        raw_obs = env.reset(seed=episode_seed)
+        if env.current_episode_seed != episode_seed:
+            raise RuntimeError(
+                f"Environment reset seed mismatch: requested={episode_seed}, "
+                f"actual={env.current_episode_seed}"
+            )
         print(
             f"[episode-start] task={task.task_id} "
             f"episode={episode + 1}/{episodes} "
+            f"seed={episode_seed} "
             f"present_agents={int(np.count_nonzero(env.present))}/"
             f"{env.max_allies}",
             flush=True,
@@ -428,13 +457,18 @@ def evaluate_task(
         wins.append(final_win)
         episode_returns.append(total_return)
         lengths.append(timestep)
+        cumulative_wins = int(np.sum(wins))
+        cumulative_losses = len(wins) - cumulative_wins
         append_episode(
             episode_csv, task.task_id, episode + 1,
-            seed_start + episode, final_win, total_return, timestep,
+            episode_seed, final_win, total_return, timestep,
+            cumulative_wins, cumulative_losses,
         )
         print(
             f"[online] task={task.task_id} episode={episode + 1}/{episodes} "
-            f"win={int(final_win)} running_win_rate={np.mean(wins):.4f} "
+            f"seed={episode_seed} result={'WIN' if final_win else 'LOSS'} "
+            f"wins={cumulative_wins} losses={cumulative_losses} "
+            f"running_win_rate={np.mean(wins):.4f} "
             f"return={total_return:.6f} length={timestep} "
             f"offline_p={store.offline_probability:.4f}",
             flush=True,
@@ -447,9 +481,12 @@ def evaluate_task(
         "enemy_heuristic": definition.enemy_heuristic_name,
         "episodes": episodes,
         "seed_start": seed_start,
-        "seed_end": seed_start + episodes - 1,
+        "seed_end": seed_start + (episodes - 1) * seed_stride,
+        "seed_stride": seed_stride,
         "wins": int(np.sum(wins)),
+        "losses": episodes - int(np.sum(wins)),
         "win_rate": float(np.mean(wins)),
+        "result_sequence": "".join("W" if win else "L" for win in wins),
         "mean_return": float(np.mean(episode_returns)),
         "mean_length": float(np.mean(lengths)),
     }
@@ -457,9 +494,9 @@ def evaluate_task(
 
 def write_summary_csv(path: Path, results: Sequence[Mapping[str, Any]]) -> None:
     fields = (
-        "task_id", "episodes", "wins", "win_rate", "mean_return",
-        "mean_length", "seed_start", "seed_end", "physics",
-        "enemy_heuristic", "task_package",
+        "task_id", "episodes", "wins", "losses", "win_rate", "mean_return",
+        "mean_length", "seed_start", "seed_end", "seed_stride", "physics",
+        "enemy_heuristic", "result_sequence", "task_package",
     )
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as handle:
@@ -480,6 +517,8 @@ def prepare_resume(
     output_dir: Path,
     tasks: Sequence[TabxTask],
     episodes: int,
+    base_seed: int,
+    seed_stride: int,
     enabled: bool,
 ) -> tuple[list[Dict[str, Any]], set[str]]:
     episode_csv = output_dir / "episodes.csv"
@@ -501,12 +540,23 @@ def prepare_resume(
     previous = payload.get("tasks", [])
     if not isinstance(previous, list):
         raise SystemExit(f"Invalid task list in {summary_json}")
-    requested_ids = {task.task_id for task in tasks}
+    expected_seeds = {
+        task.task_id: (
+            base_seed,
+            base_seed + (episodes - 1) * seed_stride,
+        )
+        for task in tasks
+    }
     results = [
         dict(item) for item in previous
         if isinstance(item, dict)
-        and str(item.get("task_id")) in requested_ids
+        and str(item.get("task_id")) in expected_seeds
         and int(item.get("episodes", -1)) == episodes
+        and int(item.get("seed_start", -1))
+        == expected_seeds[str(item.get("task_id"))][0]
+        and int(item.get("seed_end", -1))
+        == expected_seeds[str(item.get("task_id"))][1]
+        and int(item.get("seed_stride", 1)) == seed_stride
     ]
     completed = {str(item["task_id"]) for item in results}
     if len(completed) != len(results):
@@ -514,22 +564,68 @@ def prepare_resume(
 
     # Drop rows from a task that was interrupted before its atomic summary was
     # written. It will be rerun from episode 1 with an empty online memory.
-    if episode_csv.is_file():
-        with episode_csv.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            fields = tuple(reader.fieldnames or ())
-            rows = [row for row in reader if row.get("task_id") in completed]
-        expected_fields = (
-            "task_id", "episode", "seed", "win", "return", "length"
+    if not episode_csv.is_file():
+        return [], set()
+    with episode_csv.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = tuple(reader.fieldnames or ())
+        rows = [row for row in reader if row.get("task_id") in completed]
+    if fields not in (EPISODE_FIELDS, LEGACY_EPISODE_FIELDS):
+        raise SystemExit(f"Unexpected episode CSV schema in {episode_csv}")
+    if fields == LEGACY_EPISODE_FIELDS:
+        counts: Dict[str, list[int]] = {}
+        migrated_rows = []
+        for row in rows:
+            task_id = str(row["task_id"])
+            win = int(row["win"])
+            counts.setdefault(task_id, [0, 0])
+            counts[task_id][0 if win else 1] += 1
+            episode = int(row["episode"])
+            migrated_rows.append(
+                {
+                    **row,
+                    "result": "WIN" if win else "LOSS",
+                    "loss": int(not win),
+                    "cumulative_wins": counts[task_id][0],
+                    "cumulative_losses": counts[task_id][1],
+                    "running_win_rate": f"{counts[task_id][0] / episode:.9g}",
+                }
+            )
+        rows = migrated_rows
+
+    rows_by_task: Dict[str, list[Dict[str, str]]] = {}
+    for row in rows:
+        rows_by_task.setdefault(str(row["task_id"]), []).append(row)
+    valid_completed = set()
+    for task_id in completed:
+        task_rows = rows_by_task.get(task_id, [])
+        seed_start = expected_seeds[task_id][0]
+        valid = len(task_rows) == episodes and all(
+            int(row["episode"]) == index
+            and int(row["seed"]) == seed_start + (index - 1) * seed_stride
+            for index, row in enumerate(task_rows, start=1)
         )
-        if fields != expected_fields:
-            raise SystemExit(f"Unexpected episode CSV schema in {episode_csv}")
-        temporary = episode_csv.with_suffix(episode_csv.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=expected_fields)
-            writer.writeheader()
-            writer.writerows(rows)
-        temporary.replace(episode_csv)
+        if valid:
+            valid_completed.add(task_id)
+    completed = valid_completed
+    results = [item for item in results if str(item["task_id"]) in completed]
+    rows = [row for row in rows if str(row["task_id"]) in completed]
+    for item in results:
+        task_rows = rows_by_task[str(item["task_id"])]
+        wins = sum(int(row["win"]) for row in task_rows)
+        item["wins"] = wins
+        item["losses"] = episodes - wins
+        item["win_rate"] = wins / episodes
+        item["seed_stride"] = seed_stride
+        item["result_sequence"] = "".join(
+            "W" if int(row["win"]) else "L" for row in task_rows
+        )
+    temporary = episode_csv.with_suffix(episode_csv.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EPISODE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(episode_csv)
     return results, completed
 
 
@@ -537,6 +633,10 @@ def main() -> int:
     cli = parse_args()
     if cli.episodes <= 0:
         raise SystemExit("--episodes must be positive")
+    if cli.seed < 0:
+        raise SystemExit("--seed must be non-negative")
+    if cli.seed_stride <= 0:
+        raise SystemExit("--seed-stride must be positive")
     config = load_yaml_config(cli.config)
     data_cfg = dict(config["data"])
     retrieval_cfg = dict(config["retrieval"])
@@ -553,12 +653,15 @@ def main() -> int:
         raw_data_root=raw_data_root,
         task_package_roots=cli.task_package_root,
     )
+    normalization_manifest = Path(
+        str(data_cfg.get("normalization_manifest", data_cfg["manifest"]))
+    )
     normalizer = ObservationNormalizer.load(
         Path(str(data_cfg["normalization"])),
         manifest.obs_dim,
         clip=float(data_cfg.get("normalization_clip", 10.0)),
         preserve_zeros=bool(data_cfg.get("preserve_zero_padding", True)),
-        manifest_path=manifest.path,
+        manifest_path=normalization_manifest,
     )
     device = select_device(str(training_cfg.get("device", "auto")))
     args, mac, _learner, _logger = create_model_and_learner(
@@ -608,7 +711,7 @@ def main() -> int:
     summary_json = output_dir / "summary.json"
     summary_csv = output_dir / "summary.csv"
     results, completed_task_ids = prepare_resume(
-        output_dir, tasks, cli.episodes, cli.resume
+        output_dir, tasks, cli.episodes, cli.seed, cli.seed_stride, cli.resume
     )
     if completed_task_ids:
         print(
@@ -620,8 +723,9 @@ def main() -> int:
         for task_number, task in enumerate(tasks):
             if task.task_id in completed_task_ids:
                 continue
-            # Each task owns a disjoint deterministic seed interval.
-            seed_start = cli.seed + task_number * cli.episodes
+            # Every task/scenario uses the same deterministic episode seeds so
+            # comparisons across scenarios start from the requested base seed.
+            seed_start = cli.seed
             seed_everything(seed_start, device)
             store.reset_online_memory(seed=seed_start)
             args.online_return_scale = task.return_scale
@@ -639,12 +743,12 @@ def main() -> int:
             print(
                 f"[task] {task_number + 1}/{len(tasks)} id={task.task_id} "
                 f"package={definition.path} episodes={cli.episodes} "
-                f"seed_start={seed_start}",
+                f"seed_start={seed_start} seed_stride={cli.seed_stride}",
                 flush=True,
             )
             result = evaluate_task(
                 task, definition, env, mac, store, normalizer, device,
-                cli.episodes, seed_start, episode_csv,
+                cli.episodes, seed_start, cli.seed_stride, episode_csv,
             )
             results.append(result)
             results = list(ordered_results(results, tasks))
@@ -653,6 +757,8 @@ def main() -> int:
                 "requested_tasks": len(tasks),
                 "completed_tasks": len(results),
                 "episodes_per_task": cli.episodes,
+                "base_seed": cli.seed,
+                "seed_stride": cli.seed_stride,
                 "online_memory": not cli.disable_online_memory,
                 "tasks": results,
             }
@@ -660,7 +766,7 @@ def main() -> int:
             write_summary_csv(summary_csv, results)
             print(
                 f"[task-complete] id={task.task_id} "
-                f"wins={result['wins']}/{cli.episodes} "
+                f"wins={result['wins']} losses={result['losses']} "
                 f"win_rate={result['win_rate']:.6f}",
                 flush=True,
             )
@@ -669,13 +775,17 @@ def main() -> int:
 
     total_episodes = sum(int(item["episodes"]) for item in results)
     total_wins = sum(int(item["wins"]) for item in results)
+    total_losses = total_episodes - total_wins
     final = {
         "status": "complete",
         "requested_tasks": len(tasks),
         "completed_tasks": len(results),
         "episodes_per_task": cli.episodes,
+        "base_seed": cli.seed,
+        "seed_stride": cli.seed_stride,
         "total_episodes": total_episodes,
         "total_wins": total_wins,
+        "total_losses": total_losses,
         "overall_win_rate": total_wins / max(1, total_episodes),
         "macro_win_rate": float(
             np.mean([float(item["win_rate"]) for item in results])

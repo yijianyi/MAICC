@@ -5,7 +5,7 @@ set -euo pipefail
 COMMAND="${1:-all}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RAW_DATA="${RAW_DATA:-/mnt/cfs/shaopt/data/MARL/0803_overfit_7task_train_7000record_balance_winrate}"
-DATA_OUT="${DATA_OUT:-/mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32}"
+DATA_OUT="${DATA_OUT:-/mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l100}"
 MAX_ALLIES="${MAX_ALLIES:-10}"
 MAX_ENEMIES="${MAX_ENEMIES:-10}"
 MAX_ZONES="${MAX_ZONES:-4}"
@@ -25,8 +25,8 @@ prepare() {
 
   "$PYTHON_BIN" tools/convert_tabx_to_maicc.py "$RAW_DATA" \
     --output-dir "$DATA_OUT" \
-    --sequence-length 32 \
-    --stride 32 \
+    --sequence-length 100 \
+    --stride 50 \
     --partial-policy drop \
     --compression lzf \
     --invalid-record-policy error \
@@ -36,7 +36,9 @@ prepare() {
 
   "$PYTHON_BIN" tools/compute_tabx_normalization.py \
     "$DATA_OUT/manifest.json" \
-    --output "$DATA_OUT/obs_normalization.npz"
+    --output "$DATA_OUT/obs_normalization.npz" \
+    --max-enemies "$MAX_ENEMIES" \
+    --n-zones "$MAX_ZONES"
 }
 
 case "$COMMAND" in
