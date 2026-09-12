@@ -27,6 +27,20 @@ class RetrievalBucket:
     agent_id: np.ndarray
     record_hash: np.ndarray
     episode_return: np.ndarray
+    individual_return: np.ndarray
+
+
+def normalized_utility(values, bounds):
+    values = np.asarray(values, dtype=np.float32)
+    lower, upper = map(float, bounds)
+    if upper <= lower:
+        return np.zeros_like(values)
+    return np.clip((values - lower) / (upper - lower), 0.0, 1.0)
+
+
+def hybrid_scores(similarity, team_return, individual_return, alpha, bounds):
+    return (np.asarray(similarity) + alpha * normalized_utility(team_return, bounds["team"])
+            + (1.0 - alpha) * normalized_utility(individual_return, bounds["individual"]))
 
 
 class TabxRetrievalStore:
@@ -48,6 +62,10 @@ class TabxRetrievalStore:
         index_load_mode: str = "ram",
         faiss_threads: int = 4,
         trace_search: bool = False,
+        utility_alpha: float = 0.8,
+        use_utility: bool = True,
+        expected_encoder_sha256: Optional[str] = None,
+        normalization_path: Optional[Path] = None,
     ):
         try:
             import faiss
@@ -67,7 +85,7 @@ class TabxRetrievalStore:
             raise RetrievalError(
                 f"Cannot read retrieval manifest {self.index_manifest_path}: {exc}"
             ) from exc
-        if payload.get("schema") != "tabx_retrieval_index_v2":
+        if payload.get("schema") != "tabx_retrieval_index_v3":
             raise RetrievalError(
                 f"Unsupported retrieval schema: {payload.get('schema')!r}"
             )
@@ -78,6 +96,21 @@ class TabxRetrievalStore:
                 "Retrieval index and data manifest sequence lengths differ"
             )
         self.embedding_dim = int(payload["embedding_dim"])
+        from .provenance import file_sha256
+        if payload.get("data_manifest_sha256") != file_sha256(data_manifest.path):
+            raise RetrievalError("Index data manifest hash mismatch; rebuild the index")
+        if normalization_path is not None and payload.get("normalization_sha256") != file_sha256(normalization_path):
+            raise RetrievalError("Index normalization hash mismatch; rebuild the index")
+        if expected_encoder_sha256 is not None and payload.get("encoder_sha256") != expected_encoder_sha256:
+            raise RetrievalError("Index encoder hash mismatch; rebuild the index")
+        if not 0 <= utility_alpha <= 1:
+            raise RetrievalError("utility_alpha must be in [0, 1]")
+        self.utility_alpha = float(utility_alpha)
+        self.use_utility = bool(use_utility)
+        self.utility_bounds = payload["utility_bounds"]
+        for limits in self.utility_bounds.values():
+            if len(limits) != 2 or not np.isfinite(limits).all() or limits[0] > limits[1]:
+                raise RetrievalError("Invalid utility normalization bounds")
         self.k = int(k)
         self.search_k = max(int(search_k), self.k)
         self.online_search_k = max(int(online_search_k), self.k)
@@ -141,12 +174,16 @@ class TabxRetrievalStore:
                 episode_return = np.asarray(
                     handle["episode_return"][:], dtype=np.float32
                 )
+                individual_return = np.asarray(handle["individual_return"][:], dtype=np.float32)
             size = task_index.shape[0]
+            if not np.isfinite(episode_return).all() or not np.isfinite(individual_return).all():
+                raise RetrievalError(f"Non-finite utility metadata for anchor={anchor}")
             if not (
                 row.shape[0] == size
                 and agent_id.shape[0] == size
                 and record_hash.shape[0] == size
                 and episode_return.shape[0] == size
+                and individual_return.shape[0] == size
                 and index.ntotal == size
             ):
                 raise RetrievalError(
@@ -161,6 +198,7 @@ class TabxRetrievalStore:
                     agent_id=agent_id,
                     record_hash=record_hash,
                     episode_return=episode_return,
+                    individual_return=individual_return,
                 )
         if not self.buckets:
             raise RetrievalError("Retrieval manifest contains no non-empty buckets")
@@ -176,6 +214,8 @@ class TabxRetrievalStore:
         self._online_contexts: Dict[int, list] = {
             int(anchor): [] for anchor in self._anchors
         }
+        self._online_returns = {int(anchor): [] for anchor in self._anchors}
+        self._combined_utility_bounds = {key: list(value) for key, value in self.utility_bounds.items()}
 
     def close(self) -> None:
         self.source.close()
@@ -202,6 +242,8 @@ class TabxRetrievalStore:
             for anchor in self._anchors
         }
         self._online_contexts = {int(anchor): [] for anchor in self._anchors}
+        self._online_returns = {int(anchor): [] for anchor in self._anchors}
+        self._combined_utility_bounds = {key: list(value) for key, value in self.utility_bounds.items()}
 
     @property
     def offline_probability(self) -> float:
@@ -218,11 +260,17 @@ class TabxRetrievalStore:
             return None
         queries = np.ascontiguousarray(querys, dtype=np.float32)
         self.faiss.normalize_L2(queries)
-        _distance, ids = index.search(queries, min(self.k, index.ntotal))
+        distance, ids = index.search(queries, min(self.search_k, index.ntotal))
         contexts = self._online_contexts[anchor]
         selected = []
-        for row in ids:
+        for query_id, row in enumerate(ids):
             valid = [int(value) for value in row if int(value) >= 0]
+            if self.use_utility:
+                returns = np.asarray([self._online_returns[anchor][i] for i in valid])
+                bounds = self._utility_bounds_with_online()
+                scores = hybrid_scores(distance[query_id, :len(valid)], returns[:, 0],
+                                       returns[:, 1], self.utility_alpha, bounds)
+                valid = [valid[i] for i in np.argsort(-scores, kind="stable")]
             while len(valid) < self.k:
                 valid.append(valid[len(valid) % len(valid)])
             selected.extend(contexts[value] for value in valid[: self.k])
@@ -275,6 +323,9 @@ class TabxRetrievalStore:
             starts.append(tail_start)
 
         device = next(agent.parameters()).device
+        pending = []
+        individual_return = np.zeros(n_agents, dtype=np.float64)
+        covered_until = 0
         with th.no_grad():
             for start in sorted(set(starts)):
                 end = min(length, start + context_length)
@@ -299,7 +350,11 @@ class TabxRetrievalStore:
                     th.as_tensor(value, device=device)
                     for value in (pad_rtg, pad_obs, pad_action, pad_post)
                 ]
-                embeddings = encode_dem_prefixes(agent, *tensors).cpu().numpy()
+                embeddings, predicted = encode_dem_prefixes(agent, *tensors, return_rewards=True)
+                embeddings = embeddings.cpu().numpy()
+                first = max(covered_until, start) - start
+                individual_return += predicted[0, first:valid_length].cpu().numpy().sum(0)
+                covered_until = max(covered_until, end)
                 candidate_anchors = [self._nearest_bucket(valid_length - 1).anchor]
                 if start == 0:
                     candidate_anchors.extend(
@@ -327,16 +382,36 @@ class TabxRetrievalStore:
                         )
                     if vectors:
                         matrix = np.ascontiguousarray(vectors, dtype=np.float32)
+                        if not np.isfinite(matrix).all():
+                            raise RetrievalError("Non-finite online embedding")
                         self.faiss.normalize_L2(matrix)
-                        self._online_indexes[anchor].add(matrix)
-                        self._online_contexts[anchor].extend(payloads)
+                        pending.append((anchor, matrix, payloads, np.flatnonzero(agent_present)))
+        team_return = float(rew.sum(dtype=np.float64))
+        if not np.isfinite(team_return) or not np.isfinite(individual_return).all():
+            raise RetrievalError("Non-finite online episode utility")
+        for name, values in (("team", np.asarray([team_return])),
+                             ("individual", individual_return[agent_present])):
+            if values.size:
+                limits = self._combined_utility_bounds[name]
+                limits[0] = min(limits[0], float(values.min()))
+                limits[1] = max(limits[1], float(values.max()))
+        for anchor, matrix, payloads, agent_ids in pending:
+            self._online_indexes[anchor].add(matrix)
+            self._online_contexts[anchor].extend(payloads)
+            self._online_returns[anchor].extend(
+                (team_return, float(individual_return[i])) for i in agent_ids
+            )
         self.completed_online_episodes += 1
+
+    def _utility_bounds_with_online(self):
+        return self._combined_utility_bounds
 
     def _select_candidates(
         self,
         bucket: RetrievalBucket,
         query_embeddings: np.ndarray,
         query_return: Optional[np.ndarray],
+        test_mode: bool = False,
     ) -> List[List[int]]:
         queries = np.ascontiguousarray(query_embeddings, dtype=np.float32)
         if (
@@ -376,7 +451,8 @@ class TabxRetrievalStore:
         # substantially more expensive; diversity filtering can expand the
         # candidate set adaptively when necessary.
         if self._query_record_hashes is None:
-            initial_candidates = self.online_search_k
+            initial_candidates = (max(self.online_search_k, self.search_k)
+                                  if test_mode and self.use_utility else self.online_search_k)
         else:
             initial_candidates = max(self.search_k, 128)
         candidate_count = min(bucket.index.ntotal, initial_candidates)
@@ -390,7 +466,16 @@ class TabxRetrievalStore:
                     flush=True,
                 )
             search_started = time.perf_counter()
-            _distance, indices = bucket.index.search(queries, candidate_count)
+            distance, indices = bucket.index.search(queries, candidate_count)
+            if test_mode and self.use_utility:
+                bounds = self._utility_bounds_with_online()
+                for q, ids in enumerate(indices):
+                    valid_count = int(np.count_nonzero(ids >= 0))
+                    valid_ids = ids[:valid_count].copy()
+                    scores = hybrid_scores(distance[q, :valid_count],
+                        bucket.episode_return[valid_ids], bucket.individual_return[valid_ids],
+                        self.utility_alpha, bounds)
+                    indices[q, :valid_count] = valid_ids[np.argsort(-scores, kind="stable")]
             search_elapsed = time.perf_counter() - search_started
             selected: List[List[int]] = []
             for query_index, candidates in enumerate(indices):
@@ -477,6 +562,7 @@ class TabxRetrievalStore:
             bucket,
             np.asarray(querys, dtype=np.float32),
             returns,
+            test_mode=test_mode,
         )
         observations: List[th.Tensor] = []
         rewards: List[th.Tensor] = []
@@ -526,12 +612,14 @@ def encode_dem_prefixes(
     seq_obs,
     seq_action,
     seq_post,
+    return_rewards=False,
 ):
     """Encode every timestep without rerunning DEM for every prefix."""
     import torch as th
 
     batch_size, seq_len, n_agents = seq_obs.shape[:3]
     embeddings: List[th.Tensor] = []
+    predicted_rewards = []
     for agent_id in range(n_agents):
         items = []
         if agent.args.use_rtg:
@@ -564,4 +652,7 @@ def encode_dem_prefixes(
                     result[:, 1:] + z_context[:, :-1] + z_a[:, :-1]
                 )
         embeddings.append(result)
-    return th.stack(embeddings, dim=2)
+        if return_rewards:
+            predicted_rewards.append(agent.EM_pred_reward(z_a).squeeze(-1))
+    keys = th.stack(embeddings, dim=2)
+    return (keys, th.stack(predicted_rewards, dim=2)) if return_rewards else keys

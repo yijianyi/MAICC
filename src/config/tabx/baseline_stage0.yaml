@@ -1,0 +1,43 @@
+data:
+  manifest: ${MAICC_DATA_DIR}/manifest.json
+  normalization: ${MAICC_DATA_DIR}/obs_normalization.npz
+  h5_lru_size: 16
+  normalization_clip: 10.0
+  preserve_zero_padding: true
+model:
+  agent: tabx_transformer
+  max_agents: 10
+  episode_limit: 512
+  n_embd: 64
+  n_layer: 8
+  n_head: 8
+  hidden_dim: 128
+  n_zones: 10
+  obs_visible_weight: 4.0
+  dropout: 0.1
+  encoder_use_rtg: false
+  policy_use_rtg: true
+  train_cem: true
+  max_enemies: 10
+training:
+  device: auto
+  seed: ${MAICC_SEED}
+  total_steps: 100000
+  max_batch_size: 32
+  agent_time_budget: 4096
+  learning_rate: 0.0005
+  grad_norm_clip: 10.0
+  use_amp: false
+  max_return: auto
+  min_return: auto
+  log_interval: 100
+  progress_interval: 100
+  metrics_interval: 1
+  metrics_file: training_metrics.csv
+  save_interval: 10000
+  output_dir: ${MAICC_RUN_DIR}/stage0
+retrieval:
+  k: 2
+  search_k: 128
+  max_similarity: 0.98
+  trace_search: false

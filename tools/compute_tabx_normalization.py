@@ -22,6 +22,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from tabx.manifest import TabxManifest  # noqa: E402
+from tabx.observation_layout import ObservationLayout  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=150000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--n-zones", type=int, default=4, help="Zone slot capacity")
+    parser.add_argument("--max-enemies", type=int, default=None)
     return parser.parse_args()
 
 
@@ -49,6 +52,9 @@ def main() -> int:
         raise SystemExit("h5py is required") from exc
 
     manifest = TabxManifest(cli.manifest)
+    layout = ObservationLayout.resolve(
+        manifest.obs_dim, manifest.max_agents, cli.n_zones, cli.max_enemies
+    )
     output = cli.output.expanduser().resolve()
     if output.exists() and not cli.overwrite:
         raise SystemExit(f"Output exists: {output}; use --overwrite")
@@ -108,21 +114,7 @@ def main() -> int:
         if nonzero.size:
             scale[feature] = np.percentile(nonzero, 99)
 
-    # TABX schema: own[14], (all units except self)*other[16], zones[4]*6.
-    # These dimensions are already ratios, binary flags or categorical codes.
-    semantic_unit_scale_one = {1, 4, 11, 12}
-    other_blocks = (manifest.obs_dim - 14 - 4 * 6) // 16
-    for index in semantic_unit_scale_one:
-        scale[index] = 1.0
-    for block in range(max(0, other_blocks)):
-        offset = 14 + block * 16
-        for index in (1, 4, 8, 11, 12, 13, 14):
-            scale[offset + index] = 1.0
-    zone_start = 14 + max(0, other_blocks) * 16
-    for zone in range(4):
-        # zone_type and effect/type marker are categorical/indicator fields.
-        scale[zone_start + zone * 6] = 1.0
-        scale[zone_start + zone * 6 + 5] = 1.0
+    scale[layout.semantic_indices()] = 1.0
 
     scale = scale.astype(np.float32)
     scale[~np.isfinite(scale) | (scale < 1e-6)] = 1.0
@@ -144,6 +136,9 @@ def main() -> int:
         ),
         obs_dim=np.asarray(manifest.obs_dim, dtype=np.int64),
         max_agents=np.asarray(manifest.max_agents, dtype=np.int64),
+        max_enemies=np.asarray(layout.max_enemies, dtype=np.int64),
+        n_zones=np.asarray(layout.n_zones, dtype=np.int64),
+        other_unit_blocks=np.asarray(layout.other_blocks, dtype=np.int64),
         sequence_length=np.asarray(manifest.sequence_length, dtype=np.int64),
     )
     print(

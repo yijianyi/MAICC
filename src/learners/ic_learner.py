@@ -86,7 +86,16 @@ class ICLearner:
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, buffer, train_mode):
         if train_mode != self.train_mode:
             self.configure_train_mode(train_mode)
-        self.mac.agent.train()
+        if train_mode == 1:
+            # A stationary FAISS space requires deterministic frozen encoders,
+            # not just requires_grad=False. Keep dropout only in the policy.
+            self.mac.agent.eval()
+            self.mac.agent.DT.train()
+            for name, module in self.mac.agent.named_children():
+                if name.startswith("DT_"):
+                    module.train()
+        else:
+            self.mac.agent.train()
         seq_rtg, seq_obs, seq_action, seq_post, seq_ret, mask, present = (
             self._sequences(batch)
         )
@@ -179,11 +188,12 @@ class ICLearner:
                 continue
             rand_t = random.randint(1, min(seq_len, max_valid))
             query_mask = agent_mask[:, :rand_t]
-            query_embedding = self.mac.agent.get_dem_traj_embedding(
-                seq_rtg[:, :rand_t], policy_obs[:, :rand_t, agent_id],
-                seq_action[:, :rand_t, agent_id], seq_post[:, :rand_t],
-                query_mask,
-            )[0].cpu().numpy()
+            with th.no_grad():
+                query_embedding = self.mac.agent.get_dem_traj_embedding(
+                    seq_rtg[:, :rand_t], policy_obs[:, :rand_t, agent_id],
+                    seq_action[:, :rand_t, agent_id], seq_post[:, :rand_t],
+                    query_mask,
+                )[0].cpu().numpy()
             retrieval = buffer.mips(
                 query_embedding, rand_t - 1, query_return=seq_ret[:, -1]
             )

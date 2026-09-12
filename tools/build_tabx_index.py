@@ -25,6 +25,8 @@ from tabx.episode_adapter import (  # noqa: E402
 from tabx.manifest import TabxManifest  # noqa: E402
 from tabx.normalization import ObservationNormalizer  # noqa: E402
 from tabx.retrieval_store import encode_dem_prefixes  # noqa: E402
+from tabx.episode_utility import compute_episode_utilities  # noqa: E402
+from tabx.provenance import encoder_sha256, file_sha256, source_identity  # noqa: E402
 from tabx.training import (  # noqa: E402
     create_model_and_learner,
     select_device,
@@ -54,6 +56,7 @@ def create_metadata_file(path: Path):
         ("agent_id", np.int16),
         ("record_hash", np.uint64),
         ("episode_return", np.float32),
+        ("individual_return", np.float32),
     ):
         handle.create_dataset(
             key,
@@ -175,8 +178,13 @@ def main() -> int:
     )
     try:
         causal_check_done = False
+        utility_bounds = {"team": [float("inf"), -float("inf")],
+                          "individual": [float("inf"), -float("inf")]}
         with th.no_grad():
             for task in source.tasks:
+                print(f"[utility] encoding complete episodes for {task.task_id}", flush=True)
+                team_returns, individual_returns = compute_episode_utilities(
+                    source, task, mac.agent, device, rows_per_batch)
                 if (
                     max_rows_per_task > 0
                     and task.n_trajectories > max_rows_per_task
@@ -244,11 +252,16 @@ def main() -> int:
                                 "row": rows[row_ids].astype(np.int64),
                                 "agent_id": agent_ids.astype(np.int16),
                                 "record_hash": record_hashes[row_ids],
-                                "episode_return": final_returns[row_ids].astype(
-                                    np.float32
-                                ),
+                                "episode_return": team_returns[rows[row_ids]],
+                                "individual_return": individual_returns[rows[row_ids], agent_ids],
                             },
                         )
+                        for name, values in (
+                            ("team", team_returns[rows[row_ids]]),
+                            ("individual", individual_returns[rows[row_ids], agent_ids]),
+                        ):
+                            utility_bounds[name][0] = min(utility_bounds[name][0], float(values.min()))
+                            utility_bounds[name][1] = max(utility_bounds[name][1], float(values.max()))
                 print(
                     f"[index] task={task.task_id} "
                     f"rows={selected_rows.size}/{task.n_trajectories}",
@@ -272,13 +285,19 @@ def main() -> int:
             }
         )
     payload = {
-        "schema": "tabx_retrieval_index_v2",
+        "schema": "tabx_retrieval_index_v3",
         "data_manifest": str(manifest.path),
         "stage0_checkpoint": str(checkpoint),
         "embedding_dim": int(mac.agent.n_embd),
         "sequence_length": manifest.sequence_length,
         "history_buckets": [anchor + 1 for anchor in anchors],
         "index_factory": index_factory,
+        "encoder_sha256": encoder_sha256(mac.agent.state_dict()),
+        "data_manifest_sha256": file_sha256(manifest.path),
+        "normalization_sha256": file_sha256(data["normalization"]),
+        "source_identity": source_identity(),
+        "utility_bounds": utility_bounds,
+        "utility_definition": "complete_episode_dem_sum_bounded_history",
         "buckets": buckets,
     }
     temp = output_dir / ".retrieval_manifest.json.tmp"

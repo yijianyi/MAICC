@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import math
 import random
@@ -13,6 +14,7 @@ import numpy as np
 from .episode_adapter import TabxEpisodeSource
 from .manifest import TabxManifest
 from .normalization import ObservationNormalizer
+from .provenance import encoder_sha256
 
 
 class TabxTrainingError(RuntimeError):
@@ -199,6 +201,12 @@ def build_maicc_args(
         )
     encoder_use_rtg = bool(model.get("encoder_use_rtg", False))
     policy_use_rtg = bool(model.get("policy_use_rtg", True))
+    from .observation_layout import ObservationLayout
+    layout = ObservationLayout.resolve(
+        manifest.obs_dim, max_agents, int(model.get("n_zones", 4)),
+        model.get("max_enemies"),
+    )
+    layout.check_normalizer(config.get("data", {}).get("normalization"))
     if encoder_use_rtg:
         raise TabxTrainingError("TABX CEM/DEM must use encoder_use_rtg=false")
     if not policy_use_rtg:
@@ -225,6 +233,8 @@ def build_maicc_args(
         dropout=float(model.get("dropout", 0.1)),
         hidden_dim=int(model.get("hidden_dim", 128)),
         n_zones=int(model.get("n_zones", 4)),
+        max_enemies=layout.max_enemies,
+        obs_other_blocks=layout.other_blocks,
         obs_visible_weight=float(model.get("obs_visible_weight", 4.0)),
         # Kept for the original TransformerAgent internals: this flag controls
         # only CEM/DEM. DT retains its original RTG token unconditionally.
@@ -293,6 +303,8 @@ def save_checkpoint(
     checkpoint_dir = root / f"step_{step:09d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     learner.save_models(str(checkpoint_dir))
+    from .provenance import write_training_provenance
+    write_training_provenance(checkpoint_dir, config, manifest, learner.mac.agent)
     th.save(
         {
             "step": int(step),
@@ -332,7 +344,9 @@ def load_checkpoint(checkpoint_dir: Path, learner, device: str) -> int:
     state_path = checkpoint / "trainer_state.th"
     if not state_path.is_file():
         return 0
-    state = th.load(str(state_path), map_location="cpu")
+    # This is our trusted local training-state file, containing NumPy RNG state
+    # as well as tensors; modern PyTorch's weights-only default cannot load it.
+    state = th.load(str(state_path), map_location="cpu", weights_only=False)
     random.setstate(state["python_random_state"])
     np.random.set_state(state["numpy_random_state"])
     th.set_rng_state(state["torch_random_state"])
@@ -353,6 +367,11 @@ def run_stage0(
 ) -> Path:
     import torch as th
 
+    config = copy.deepcopy(dict(config))
+    config.setdefault("data", {}).update(
+        manifest=str(manifest_path),
+        normalization=str(normalization_path) if normalization_path is not None else None,
+    )
     manifest = TabxManifest(manifest_path)
     device = select_device(requested_device)
     training = dict(config.get("training", {}))
@@ -374,6 +393,8 @@ def run_stage0(
     output_dir = Path(str(training.get("output_dir", "results/tabx/stage0")))
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if resume is None and any(output_dir.glob("step_*/agent.th")):
+        raise TabxTrainingError("Output already contains checkpoints; use a new directory or --resume")
     total_steps = int(training.get("total_steps", 100000))
     save_interval = int(training.get("save_interval", 10000))
     max_batch_size = int(training.get("max_batch_size", 8))
@@ -472,6 +493,9 @@ def run_stage1(
 ) -> Path:
     from .retrieval_store import TabxRetrievalStore
 
+    config = copy.deepcopy(dict(config))
+    config.setdefault("data", {}).update(manifest=str(manifest_path), normalization=str(normalization_path))
+    config.setdefault("retrieval", {}).update(stage0_checkpoint=str(stage0_checkpoint), index_manifest=str(index_manifest_path))
     manifest = TabxManifest(manifest_path)
     device = select_device(requested_device)
     training = dict(config.get("training", {}))
@@ -493,6 +517,8 @@ def run_stage1(
     output_dir = Path(str(training.get("output_dir", "results/tabx/stage1")))
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if resume is None and any(output_dir.glob("step_*/agent.th")):
+        raise TabxTrainingError("Output already contains checkpoints; use a new directory or --resume")
 
     start_step = 0
     if resume is not None:
@@ -531,6 +557,10 @@ def run_stage1(
         index_load_mode=str(retrieval.get("index_load_mode", "ram")),
         faiss_threads=int(retrieval.get("faiss_threads", 4)),
         trace_search=bool(retrieval.get("trace_search", False)),
+        utility_alpha=float(retrieval.get("utility_alpha", 0.8)),
+        use_utility=bool(retrieval.get("use_utility", True)),
+        expected_encoder_sha256=encoder_sha256(mac.agent.state_dict()),
+        normalization_path=normalization_path,
     )
     metric_writer = TrainingMetricWriter(metrics_path, resume_step=start_step)
     print(

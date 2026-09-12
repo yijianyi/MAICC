@@ -1,0 +1,16 @@
+# Zero-based ally slots. Each task must have at least three enabled allies.
+teammate_modes:
+  - name: all_model
+    policies: {}
+  - name: novice_0
+    policies: {0: novice}
+  - name: medium_0
+    policies: {0: medium}
+  - name: expert_0
+    policies: {0: expert}
+  - name: novice_0_1
+    policies: {0: novice, 1: novice}
+  - name: medium_0_1
+    policies: {0: medium, 1: medium}
+  - name: expert_0_1
+    policies: {0: expert, 1: expert}

@@ -63,6 +63,10 @@ class FactorizedCEM(nn.Module):
         self.slot_embedding = nn.Embedding(self.max_slots, self.n_embd)
         self.time_embedding = nn.Embedding(self.max_timesteps, self.n_embd)
         self.output_norm = nn.LayerNorm(self.n_embd)
+        # Each timestep's post summary can see all current obs/actions/post.
+        # Shift it BEFORE sharing with other slots: current targets stay hidden,
+        # while observation/action representations gain past action/reward input.
+        self.history_projection = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def _spatial_attention_mask(
         self, slots: int, n_agents: int, device: th.device
@@ -180,7 +184,12 @@ class FactorizedCEM(nn.Module):
         spatial_output = spatial_output.masked_fill(
             ~spatial_valid.unsqueeze(-1), 0.0
         )
-        temporal_input = spatial_output.permute(0, 2, 1, 3).reshape(
+        history = th.cat([
+            th.zeros_like(spatial_output[:, :1, -1]),
+            spatial_output[:, :-1, -1],
+        ], dim=1)
+        temporal_values = spatial_output + self.history_projection(history).unsqueeze(2)
+        temporal_input = temporal_values.permute(0, 2, 1, 3).reshape(
             batch_size * slots, timesteps, width
         )
         causal_mask = th.triu(

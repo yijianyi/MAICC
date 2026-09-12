@@ -394,9 +394,10 @@ class TransformerAgent(nn.Module):
             # them as valid transition targets, but upweight visible blocks so
             # the Gaussian loss cannot be minimized mostly by predicting zero.
             n_zones = int(getattr(self.args, "n_zones", 4))
-            other_blocks = max(
-                0, (self.input_shape - 14 - 6 * n_zones) // 16
-            )
+            remainder = self.input_shape - 14 - 6 * n_zones
+            if remainder < 0 or remainder % 16:
+                raise ValueError("TABX observation layout/n_zones mismatch")
+            other_blocks = remainder // 16
             visible_weight = float(
                 getattr(self.args, "obs_visible_weight", 4.0)
             )
