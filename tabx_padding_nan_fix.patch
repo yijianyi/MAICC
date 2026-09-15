@@ -1,0 +1,30 @@
+diff --git a/TABX/src/tabx/tabx.py b/TABX/src/tabx/tabx.py
+index 58edc38..439f1bc 100644
+--- a/TABX/src/tabx/tabx.py
++++ b/TABX/src/tabx/tabx.py
+@@ -289,14 +289,22 @@ class ParsedState:
+     @classmethod
+     def from_state(cls, state, keys) -> "ParsedState":
+         healths = jnp.stack([state[unit].status.health for unit in keys])
+-        max_healths = healths / jnp.stack([state[unit].status.max_health for unit in keys])
++        maximum_healths = jnp.stack([state[unit].status.max_health for unit in keys])
++        disabled = jnp.stack([state[unit].status.is_disabled for unit in keys])
++        # Padding has zero health/cooldown capacities. Avoid 0/0 at its source:
++        # multiplication by the visibility mask cannot remove a NaN afterwards.
++        padding = disabled & (maximum_healths == 0)
++        max_healths = jnp.where(padding, 0.0, healths) / jnp.where(
++            padding, 1.0, maximum_healths
++        )
+         positions = jnp.stack([state[unit].transform.position for unit in keys])
+         rotations = jnp.stack([state[unit].transform.rotation for unit in keys]) / (jnp.pi * 2)
+         attack_ranges = jnp.stack([state[unit].status.attack_range for unit in keys])
+         attack_damages = jnp.stack([state[unit].status.attack_damage for unit in keys])
+         cooldowns = jnp.stack([state[unit].status.cooldown for unit in keys])
+-        attack_cooldowns = cooldowns / jnp.stack(
+-            [state[unit].status.attack_cooldown for unit in keys]
++        cooldown_limits = jnp.stack([state[unit].status.attack_cooldown for unit in keys])
++        attack_cooldowns = jnp.where(padding, 0.0, cooldowns) / jnp.where(
++            padding, 1.0, cooldown_limits
+         )
+ 
+         body_radiuss = jnp.stack([state[unit].collider.radius for unit in keys])

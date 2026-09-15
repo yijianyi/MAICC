@@ -19,6 +19,9 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from tabx.teammate_modes import (
+    load_teammate_modes, condition_metadata, add_baseline_deltas,
+)
 from tabx.config import load_yaml_config  # noqa: E402
 from tabx.manifest import TabxManifest, TabxTask  # noqa: E402
 from tabx.normalization import ObservationNormalizer  # noqa: E402
@@ -42,6 +45,14 @@ DEFAULT_RAW_DATA = Path(
 )
 
 
+CONDITION_FIELDS = (
+    "condition_id", "teammate_mode", "teammate_policies",
+    "replaced_agent_ids", "replacement_count",
+)
+EPISODE_FIELDS = CONDITION_FIELDS + (
+    "task_id", "episode", "seed", "win", "return", "length",
+)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -53,6 +64,8 @@ def parse_args() -> argparse.Namespace:
         "--config", type=Path,
         default=REPO_ROOT / "src/config/tabx/tabx_stage1.yaml",
     )
+    parser.add_argument("--teammate-config", type=Path,
+                        help="YAML teammate_modes; omitted means all_model only")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--task-id", action="append", dest="task_ids",
@@ -77,8 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume", action="store_true",
         help=(
-            "Keep fully completed tasks from summary.json and restart only "
-            "the interrupted task so its online memory remains consistent."
+            "Keep fully completed task/mode conditions and restart only "
+            "the interrupted condition with empty online memory."
         ),
     )
     parser.add_argument(
@@ -243,8 +256,9 @@ def append_episode(
     win: bool,
     episode_return: float,
     length: int,
+    condition: Mapping[str, Any],
 ) -> None:
-    fields = ("task_id", "episode", "seed", "win", "return", "length")
+    fields = EPISODE_FIELDS
     write_header = not path.is_file() or path.stat().st_size == 0
     with path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -252,6 +266,7 @@ def append_episode(
             writer.writeheader()
         writer.writerow(
             {
+                **condition,
                 "task_id": task_id,
                 "episode": episode,
                 "seed": seed,
@@ -301,6 +316,7 @@ def evaluate_task(
     episodes: int,
     seed_start: int,
     episode_csv: Path,
+    condition: Mapping[str, Any],
 ) -> Dict[str, Any]:
     import torch as th
     from components.episode_buffer import EpisodeBatch
@@ -339,7 +355,7 @@ def evaluate_task(
     for episode in range(episodes):
         raw_obs = env.reset()
         print(
-            f"[episode-start] task={task.task_id} "
+            f"[episode-start] task={task.task_id} mode={condition['teammate_mode']} "
             f"episode={episode + 1}/{episodes} "
             f"present_agents={int(np.count_nonzero(env.present))}/"
             f"{env.max_allies}",
@@ -391,11 +407,13 @@ def evaluate_task(
                 )[0]
             action_np = chosen.detach().cpu().numpy()
             reward, done, info = env.step(action_np)
+            action_np = env.last_executed_actions.copy()
+            executed = th.as_tensor(action_np, dtype=th.long, device=device)
             final_win = bool(info.get("is_win", False))
             completion = bool(done and final_win)
             batch.update(
                 {
-                    "actions": chosen[None, :, None],
+                    "actions": executed[None, :, None],
                     "reward": [(reward,)],
                     "terminated": [(done,)],
                     "completion": [(completion,)],
@@ -430,10 +448,10 @@ def evaluate_task(
         lengths.append(timestep)
         append_episode(
             episode_csv, task.task_id, episode + 1,
-            seed_start + episode, final_win, total_return, timestep,
+            seed_start + episode, final_win, total_return, timestep, condition,
         )
         print(
-            f"[online] task={task.task_id} episode={episode + 1}/{episodes} "
+            f"[online] task={task.task_id} mode={condition['teammate_mode']} episode={episode + 1}/{episodes} "
             f"win={int(final_win)} running_win_rate={np.mean(wins):.4f} "
             f"return={total_return:.6f} length={timestep} "
             f"offline_p={store.offline_probability:.4f}",
@@ -441,6 +459,7 @@ def evaluate_task(
         )
 
     return {
+        **condition,
         "task_id": task.task_id,
         "task_package": str(definition.path),
         "physics": definition.physics_name,
@@ -449,6 +468,7 @@ def evaluate_task(
         "seed_start": seed_start,
         "seed_end": seed_start + episodes - 1,
         "wins": int(np.sum(wins)),
+        "losses": episodes - int(np.sum(wins)),
         "win_rate": float(np.mean(wins)),
         "mean_return": float(np.mean(episode_returns)),
         "mean_length": float(np.mean(lengths)),
@@ -456,7 +476,8 @@ def evaluate_task(
 
 
 def write_summary_csv(path: Path, results: Sequence[Mapping[str, Any]]) -> None:
-    fields = (
+    fields = CONDITION_FIELDS + (
+        "delta_win_rate", "delta_mean_return", "losses",
         "task_id", "episodes", "wins", "win_rate", "mean_return",
         "mean_length", "seed_start", "seed_end", "physics",
         "enemy_heuristic", "task_package",
@@ -469,66 +490,66 @@ def write_summary_csv(path: Path, results: Sequence[Mapping[str, Any]]) -> None:
     temporary.replace(path)
 
 
-def ordered_results(
-    results: Sequence[Mapping[str, Any]], tasks: Sequence[TabxTask]
-) -> list[Mapping[str, Any]]:
-    rank = {task.task_id: index for index, task in enumerate(tasks)}
-    return sorted(results, key=lambda item: rank[str(item["task_id"])])
-
-
 def prepare_resume(
     output_dir: Path,
-    tasks: Sequence[TabxTask],
+    conditions: Sequence[Mapping[str, Any]],
     episodes: int,
+    seed: int,
     enabled: bool,
+    run_spec: Mapping[str, Any],
 ) -> tuple[list[Dict[str, Any]], set[str]]:
     episode_csv = output_dir / "episodes.csv"
     summary_json = output_dir / "summary.json"
-    if not enabled:
+    spec_path = output_dir / "run_spec.json"
+    if spec_path.exists():
+        if not enabled:
+            raise SystemExit("Output exists; use --resume or a new --output-dir")
+        if json.loads(spec_path.read_text()) != run_spec:
+            raise SystemExit("Resume configuration/checkpoint mismatch; use a new --output-dir")
+    else:
         if episode_csv.exists() or summary_json.exists():
-            raise SystemExit(
-                f"Evaluation output already exists in {output_dir}. Use "
-                "--resume to retain fully completed tasks, or choose a new "
-                "--output-dir."
-            )
-        return [], set()
-    if not summary_json.is_file():
-        # No task reached an atomic completion point. Restart cleanly.
-        if episode_csv.exists():
-            episode_csv.unlink()
-        return [], set()
-    payload = json.loads(summary_json.read_text(encoding="utf-8"))
-    previous = payload.get("tasks", [])
-    if not isinstance(previous, list):
-        raise SystemExit(f"Invalid task list in {summary_json}")
-    requested_ids = {task.task_id for task in tasks}
-    results = [
-        dict(item) for item in previous
-        if isinstance(item, dict)
-        and str(item.get("task_id")) in requested_ids
-        and int(item.get("episodes", -1)) == episodes
-    ]
-    completed = {str(item["task_id"]) for item in results}
-    if len(completed) != len(results):
-        raise SystemExit(f"Duplicate completed tasks in {summary_json}")
-
-    # Drop rows from a task that was interrupted before its atomic summary was
-    # written. It will be rerun from episode 1 with an empty online memory.
-    if episode_csv.is_file():
-        with episode_csv.open("r", encoding="utf-8", newline="") as handle:
+            raise SystemExit("Legacy output has no run_spec.json; use a new --output-dir")
+        atomic_write_json(spec_path, run_spec)
+    previous = json.loads(summary_json.read_text()).get("tasks", []) if summary_json.exists() else []
+    expected = {c["condition_id"]: c for c in conditions}
+    results = []
+    for item in previous:
+        cid = item.get("condition_id")
+        if cid in expected and all(item.get(k) == v for k, v in expected[cid].items()):
+            if item.get("episodes") == episodes and item.get("seed_start") == seed:
+                results.append(dict(item))
+    if len({r["condition_id"] for r in results}) != len(results):
+        raise SystemExit("Duplicate completed conditions in summary.json")
+    rows = []
+    if episode_csv.exists():
+        with episode_csv.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            fields = tuple(reader.fieldnames or ())
-            rows = [row for row in reader if row.get("task_id") in completed]
-        expected_fields = (
-            "task_id", "episode", "seed", "win", "return", "length"
-        )
-        if fields != expected_fields:
-            raise SystemExit(f"Unexpected episode CSV schema in {episode_csv}")
-        temporary = episode_csv.with_suffix(episode_csv.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=expected_fields)
+            if tuple(reader.fieldnames or ()) != EPISODE_FIELDS:
+                raise SystemExit("Unexpected episodes.csv schema")
+            rows = list(reader)
+    by_condition = {}
+    for row in rows:
+        by_condition.setdefault(row["condition_id"], []).append(row)
+    completed = set()
+    for result in results:
+        cid = result["condition_id"]
+        records = by_condition.get(cid, [])
+        if len(records) == episodes and all(
+            int(row["episode"]) == i + 1 and int(row["seed"]) == seed + i
+            and row["task_id"] == result["task_id"]
+            and all(row[k] == str(v) for k, v in expected[cid].items())
+            for i, row in enumerate(records)
+        ):
+            completed.add(cid)
+    results = [r for r in results if r["condition_id"] in completed]
+    # Discard interrupted conditions: their memory is reconstructed by replaying
+    # the whole condition, never by continuing with a fresh empty store midway.
+    if episode_csv.exists():
+        temporary = episode_csv.with_suffix(".csv.tmp")
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=EPISODE_FIELDS)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(r for r in rows if r["condition_id"] in completed)
         temporary.replace(episode_csv)
     return results, completed
 
@@ -537,6 +558,9 @@ def main() -> int:
     cli = parse_args()
     if cli.episodes <= 0:
         raise SystemExit("--episodes must be positive")
+    if cli.seed < 0 or cli.episode_limit <= 0:
+        raise SystemExit("seed must be nonnegative and episode-limit positive")
+    modes = load_teammate_modes(cli.teammate_config)
     config = load_yaml_config(cli.config)
     data_cfg = dict(config["data"])
     retrieval_cfg = dict(config["retrieval"])
@@ -552,6 +576,49 @@ def main() -> int:
         tasks=tasks,
         raw_data_root=raw_data_root,
         task_package_roots=cli.task_package_root,
+    )
+    if len({task.task_id for task in tasks}) != len(tasks):
+        raise SystemExit("Duplicate requested task IDs")
+    # Validate all conditions before loading the checkpoint or starting rollouts.
+    for task in tasks:
+        scenario = definitions[task.task_id].task["scenario"]
+        teams = np.asarray(scenario["teams"]).reshape(-1)
+        disabled = np.asarray(scenario.get("is_disabled", np.zeros_like(teams))).reshape(-1)
+        active = set(np.flatnonzero(~disabled[teams == 0].astype(bool)).tolist())
+        for mode in modes:
+            replaced = set(mode["policies"])
+            if replaced and (not replaced < active or max(replaced) >= cli.max_allies):
+                raise SystemExit(
+                    f"Invalid mode {mode['name']} for {task.task_id}: "
+                    f"replace={sorted(replaced)}, enabled allies={sorted(active)}; "
+                    "retain at least one model ally"
+                )
+    conditions = [condition_metadata(t.task_id, m) for t in tasks for m in modes]
+    output_dir = cli.output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = cli.checkpoint.expanduser().resolve() / "agent.th"
+    checkpoint_stat = checkpoint_file.stat()
+    run_spec = json.loads(json.dumps({
+        "schema": "tabx_teammates_v1", "config": config,
+        "checkpoint": str(checkpoint_file),
+        "checkpoint_size": checkpoint_stat.st_size,
+        "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
+        "conditions": conditions, "episodes": cli.episodes, "seed": cli.seed,
+        "online_memory": not cli.disable_online_memory,
+        "capacities": [cli.max_allies, cli.max_enemies, cli.max_zones],
+        "episode_limit": cli.episode_limit,
+        "tabx_root": str(resolve_tabx_root(cli.tabx_root)),
+        "task_definitions": {t.task_id: definitions[t.task_id].task for t in tasks},
+        "task_settings": {
+            t.task_id: {
+                "physics": definitions[t.task_id].physics_name,
+                "enemy_heuristic": definitions[t.task_id].enemy_heuristic_name,
+                "return_scale": t.return_scale, "target_return": t.target_return,
+            } for t in tasks
+        },
+    }))
+    results, completed_condition_ids = prepare_resume(
+        output_dir, conditions, cli.episodes, cli.seed, cli.resume, run_spec
     )
     normalizer = ObservationNormalizer.load(
         Path(str(data_cfg["normalization"])),
@@ -602,68 +669,61 @@ def main() -> int:
     )
     mac.buffer = store
 
-    output_dir = cli.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     episode_csv = output_dir / "episodes.csv"
     summary_json = output_dir / "summary.json"
     summary_csv = output_dir / "summary.csv"
-    results, completed_task_ids = prepare_resume(
-        output_dir, tasks, cli.episodes, cli.resume
-    )
-    if completed_task_ids:
-        print(
-            "[resume] keeping completed tasks: "
-            + ", ".join(sorted(completed_task_ids)),
-            flush=True,
-        )
+
+    def save_progress(status):
+        add_baseline_deltas(results)
+        atomic_write_json(summary_json, {
+            "status": status,
+            "requested_tasks": len(tasks),
+            "requested_conditions": len(conditions),
+            "completed_conditions": len(results),
+            "episodes_per_condition": cli.episodes,
+            "online_memory": not cli.disable_online_memory,
+            "tasks": results,
+        })
+        write_summary_csv(summary_csv, results)
+
     try:
-        for task_number, task in enumerate(tasks):
-            if task.task_id in completed_task_ids:
-                continue
-            # Each task owns a disjoint deterministic seed interval.
-            seed_start = cli.seed + task_number * cli.episodes
-            seed_everything(seed_start, device)
-            store.reset_online_memory(seed=seed_start)
-            args.online_return_scale = task.return_scale
-            args.online_target_rtg = task.target_return / task.return_scale
-            definition = definitions[task.task_id]
-            env = build_environment(
-                tabx_root=cli.tabx_root,
-                definition=definition,
-                seed=seed_start,
-                max_allies=cli.max_allies,
-                max_enemies=cli.max_enemies,
-                max_zones=cli.max_zones,
-                episode_limit=cli.episode_limit,
-            )
-            print(
-                f"[task] {task_number + 1}/{len(tasks)} id={task.task_id} "
-                f"package={definition.path} episodes={cli.episodes} "
-                f"seed_start={seed_start}",
-                flush=True,
-            )
-            result = evaluate_task(
-                task, definition, env, mac, store, normalizer, device,
-                cli.episodes, seed_start, episode_csv,
-            )
-            results.append(result)
-            results = list(ordered_results(results, tasks))
-            combined = {
-                "status": "running",
-                "requested_tasks": len(tasks),
-                "completed_tasks": len(results),
-                "episodes_per_task": cli.episodes,
-                "online_memory": not cli.disable_online_memory,
-                "tasks": results,
-            }
-            atomic_write_json(summary_json, combined)
-            write_summary_csv(summary_csv, results)
-            print(
-                f"[task-complete] id={task.task_id} "
-                f"wins={result['wins']}/{cli.episodes} "
-                f"win_rate={result['win_rate']:.6f}",
-                flush=True,
-            )
+        save_progress("running")
+        for task in tasks:
+            for mode in modes:
+                condition = condition_metadata(task.task_id, mode)
+                if condition["condition_id"] in completed_condition_ids:
+                    continue
+                # Every condition starts from identical seeds and empty online memory.
+                seed_start = cli.seed
+                seed_everything(seed_start, device)
+                store.reset_online_memory(seed=seed_start)
+                args.online_return_scale = task.return_scale
+                args.online_target_rtg = task.target_return / task.return_scale
+                definition = definitions[task.task_id]
+                env = build_environment(
+                    tabx_root=cli.tabx_root, definition=definition, seed=seed_start,
+                    max_allies=cli.max_allies, max_enemies=cli.max_enemies,
+                    max_zones=cli.max_zones, episode_limit=cli.episode_limit,
+                )
+                env.configure_teammates(mode["policies"])
+                print(
+                    f"[condition] task={task.task_id} mode={mode['name']} "
+                    f"policies={mode['policies']} episodes={cli.episodes} "
+                    f"seed_start={seed_start} memory=reset", flush=True,
+                )
+                result = evaluate_task(
+                    task, definition, env, mac, store, normalizer, device,
+                    cli.episodes, seed_start, episode_csv, condition,
+                )
+                results.append(result)
+                rank = {c["condition_id"]: i for i, c in enumerate(conditions)}
+                results.sort(key=lambda r: rank[r["condition_id"]])
+                save_progress("running")
+                print(
+                    f"[condition-complete] task={task.task_id} mode={mode['name']} "
+                    f"wins={result['wins']}/{cli.episodes} "
+                    f"win_rate={result['win_rate']:.6f}", flush=True,
+                )
     finally:
         store.close()
 
@@ -672,8 +732,9 @@ def main() -> int:
     final = {
         "status": "complete",
         "requested_tasks": len(tasks),
-        "completed_tasks": len(results),
-        "episodes_per_task": cli.episodes,
+        "requested_conditions": len(conditions),
+        "completed_conditions": len(results),
+        "episodes_per_condition": cli.episodes,
         "total_episodes": total_episodes,
         "total_wins": total_wins,
         "overall_win_rate": total_wins / max(1, total_episodes),

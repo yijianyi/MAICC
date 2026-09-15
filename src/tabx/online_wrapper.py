@@ -33,6 +33,27 @@ class TabxOnlineWrapper:
         self.obs_dim = int(env.observation_spaces[self.ally_keys[0]].shape[0])
         self.episode_limit = int(getattr(env, "max_episode_steps", 512))
         self.present = np.ones(self.max_allies, dtype=bool)
+        self.teammate_policies = {}
+        self._teammate_params = {}
+        self._teammate_targets = {}
+        self._teammate_rngs = {}
+        self.last_executed_actions = None
+
+    def configure_teammates(self, policies: Mapping[int, str]) -> None:
+        """Configure zero-based ally slots before resetting the environment."""
+        from .teammate_modes import validate_policies
+
+        self.teammate_policies = validate_policies(policies)
+        if any(i >= self.max_allies for i in self.teammate_policies):
+            raise ValueError("Teammate agent ID exceeds max_allies")
+        self._teammate_params = {}
+        if self.teammate_policies:
+            from src.tabx.heuristic_policy import build_batched_heuristic_params
+
+            self._teammate_params = {
+                i: build_batched_heuristic_params(name)
+                for i, name in self.teammate_policies.items()
+            }
 
     @staticmethod
     def _numpy(value: Any) -> np.ndarray:
@@ -74,12 +95,58 @@ class TabxOnlineWrapper:
         return np.asarray(values, dtype=bool)
 
     def reset(self):
+        episode_seed = self.seed + self.episode_index
         observations, self.state = self.env.reset(
             self._reset_key(), self.env_params
         )
         self.present = self._detect_present()
+        self.last_executed_actions = None
+        self._teammate_targets = {}
+        self._teammate_rngs = {}
+        if self.teammate_policies:
+            import jax
+            from src.tabx.heuristic_policy import LastVisibleTarget
+
+            raw = self.state["state"]
+            active = {
+                i for i, unit in enumerate(self.ally_keys)
+                if self.present[i] and not bool(np.asarray(raw[unit].status.is_disabled).item())
+            }
+            if not set(self.teammate_policies) < active:
+                raise ValueError(
+                    "Replace only present, enabled allies and retain at least one model ally; "
+                    f"requested={sorted(self.teammate_policies)}, active={sorted(active)}"
+                )
+            for i in self.teammate_policies:
+                self._teammate_targets[i] = LastVisibleTarget()
+                # Independent from the environment/enemy stream, and from other allies.
+                root = jax.random.fold_in(jax.random.PRNGKey(episode_seed), 0x5445414D)
+                self._teammate_rngs[i] = jax.random.fold_in(root, i)
         self._obs = self._stack_obs(observations)
         return self._obs.copy()
+
+    def _replace_teammate_actions(self, values: np.ndarray) -> None:
+        if not self.teammate_policies:
+            return
+        import jax
+        import jax.numpy as jnp
+        from src.tabx.heuristic_policy import heuristic_policy
+
+        raw = self.state["state"]
+        for i in self.teammate_policies:
+            status = raw[self.ally_keys[i]].status
+            if not bool(np.asarray(status.is_alive).item()) or bool(
+                np.asarray(status.is_disabled).item()
+            ):
+                values[i] = self.IDLE_ACTION
+                continue
+            self._teammate_rngs[i], key = jax.random.split(self._teammate_rngs[i])
+            action, self._teammate_targets[i] = heuristic_policy(
+                key, jnp.asarray(self._obs[i]), self._teammate_targets[i],
+                len(self.env.unit_keys), self.env.max_n_zone,
+                self._teammate_params[i], self.state["physics_params"],
+            )
+            values[i] = int(np.asarray(action).item())
 
     def step(self, actions: Sequence[int]):
         import jax.numpy as jnp
@@ -92,7 +159,15 @@ class TabxOnlineWrapper:
         if np.any((values < 0) | (values >= self.n_actions)):
             raise ValueError(f"Action outside [0, {self.n_actions})")
         values = values.copy()
+        self._replace_teammate_actions(values)
         values[~self.present] = self.IDLE_ACTION
+        if self.teammate_policies:
+            avail = self.get_avail_actions()
+            if np.any((values < 0) | (values >= self.n_actions)) or not np.all(
+                avail[np.arange(self.max_allies), values]
+            ):
+                raise ValueError(f"Unavailable executed ally action: {values.tolist()}")
+        self.last_executed_actions = values.copy()
         jax_values = jnp.asarray(values, dtype=jnp.int32)
         action_dict = {
             key: jax_values[index] for index, key in enumerate(self.ally_keys)
