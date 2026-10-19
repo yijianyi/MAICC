@@ -1,0 +1,599 @@
+diff --git a/tools/run_tabx_baseline_retrain.sh b/tools/run_tabx_baseline_retrain.sh
+index cb1ba1b..fe7596a 100644
+--- a/tools/run_tabx_baseline_retrain.sh
++++ b/tools/run_tabx_baseline_retrain.sh
+@@ -36,5 +36,10 @@ case "${1:-check}" in
+       --checkpoint "$MAICC_RUN_DIR/stage1/step_000100000" --episodes 100 \
+       --output-dir "$MAICC_RUN_DIR/eval" "${@:2}"
+     ;;
+-  *) echo "Usage: bash $0 {check|smoke|stage0|index|stage1|all|eval} [extra arguments]" >&2; exit 2 ;;
++  eval-parallel)
++    "$BASELINE_PYTHON" tools/eval_tabx_parallel.py --config "$BASELINE_STAGE1" \
++      --checkpoint "$MAICC_RUN_DIR/stage1/step_000100000" --episodes 100 \
++      --output-dir "$MAICC_RUN_DIR/eval_parallel" "${@:2}"
++    ;;
++  *) echo "Usage: bash $0 {check|smoke|stage0|index|stage1|all|eval|eval-parallel} [extra arguments]" >&2; exit 2 ;;
+ esac
+--- /dev/null
++++ b/tools/eval_tabx_parallel.py
+@@ -0,0 +1,355 @@
++#!/usr/bin/env python3
++"""Bounded, single-GPU subprocess evaluation, one sequential memory stream per condition."""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import os
++from pathlib import Path
++import signal
++import shutil
++import subprocess
++import sys
++import time
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / 'src'))
++from tabx.config import load_yaml_config
++from tabx.manifest import TabxManifest
++from tabx.task_package import infer_raw_data_root, load_task_definitions
++from tabx.teammate_modes import load_teammate_modes, condition_metadata, add_baseline_deltas
++
++
++def atomic_json(path, payload):
++    temporary = path.with_suffix(path.suffix + '.tmp')
++    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
++    temporary.replace(path)
++
++
++def parse_args():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--config', type=Path, required=True)
++    p.add_argument('--checkpoint', type=Path, required=True)
++    p.add_argument('--output-dir', type=Path, required=True)
++    p.add_argument('--gpu-id', type=int, default=0)
++    p.add_argument('--parallel-jobs', type=int, default=4)
++    p.add_argument('--cpu-threads', type=int, default=1)
++    p.add_argument('--cpus-per-job', type=int, default=2,
++                   help='Pin each worker to this many allowed logical CPUs; 0 disables affinity')
++    p.add_argument('--faiss-threads', type=int, default=1)
++    p.add_argument('--teammate-config', type=Path)
++    p.add_argument('--task-id', action='append', dest='task_ids')
++    p.add_argument('--episodes', type=int, default=100)
++    p.add_argument('--seed', type=int, default=10000)
++    p.add_argument('--episode-limit', type=int, default=512)
++    p.add_argument('--raw-data-root', type=Path)
++    p.add_argument('--task-package-root', type=Path, action='append', default=[])
++    p.add_argument('--tabx-root', type=Path, default=ROOT / 'TABX')
++    for name in ('allies', 'enemies', 'zones'):
++        p.add_argument('--max-' + name, type=int)
++    p.add_argument('--disable-online-memory', action='store_true')
++    p.add_argument('--resume', action='store_true')
++    p.add_argument('--invalid-mode-policy', choices=('skip', 'error'), default='skip',
++                   help='Skip and report task/mode pairs that leave no model ally or select invalid slots')
++    p.add_argument('--dry-run', action='store_true', help='Print condition plan without writing or starting workers')
++    args = p.parse_args()
++    if min(args.parallel_jobs, args.cpu_threads, args.faiss_threads, args.episodes, args.episode_limit) < 1:
++        p.error('job/thread/episode counts and episode-limit must be positive')
++    if args.gpu_id < 0 or args.seed < 0 or args.cpus_per_job < 0:
++        p.error('gpu-id, seed and cpus-per-job must be nonnegative')
++    return args
++
++
++def plan_conditions(tasks, definitions, modes, max_allies, invalid_policy):
++    import numpy as np
++    jobs, skipped = [], []
++    for task in tasks:
++        scenario = definitions[task.task_id].task['scenario']
++        teams = np.asarray(scenario['teams']).reshape(-1)
++        disabled = np.asarray(scenario.get('is_disabled', np.zeros_like(teams))).reshape(-1)
++        active = set(np.flatnonzero(~disabled[teams == 0].astype(bool)).tolist())
++        for mode in modes:
++            metadata = {'task_id': task.task_id, **condition_metadata(task.task_id, mode)}
++            replaced = set(mode['policies'])
++            if replaced and (not replaced < active or max(replaced) >= max_allies):
++                reason = f'replace={sorted(replaced)}, enabled allies={sorted(active)}; retain one model ally'
++                if invalid_policy == 'error':
++                    raise ValueError(f'{task.task_id}/{mode["name"]}: {reason}')
++                skipped.append({**metadata, 'reason': reason})
++            else:
++                # No task-provided strings become filesystem paths.
++                digest = hashlib.sha256(metadata['condition_id'].encode()).hexdigest()[:20]
++                jobs.append({'metadata': metadata, 'mode': mode, 'directory': 'condition_' + digest})
++    return jobs, skipped
++
++
++def completed_result(job, episodes, seed):
++    """Require both a completed summary and a matching full episode history."""
++    directory = Path(job['output'])
++    try:
++        payload = json.loads((directory / 'summary.json').read_text())
++        results = payload['tasks']
++        if payload.get('status') != 'complete' or len(results) != 1:
++            return None
++        result = results[0]
++        if any(result.get(k) != v for k, v in job['metadata'].items()):
++            return None
++        if result['episodes'] != episodes or result['seed_start'] != seed or result['seed_end'] != seed + episodes - 1:
++            return None
++        with (directory / 'episodes.csv').open(newline='') as f:
++            rows = list(csv.DictReader(f))
++        if len(rows) != episodes:
++            return None
++        for i, row in enumerate(rows):
++            if int(row['episode']) != i + 1 or int(row['seed']) != seed + i:
++                return None
++            if any(row.get(k) != str(v) for k, v in job['metadata'].items()):
++                return None
++        return result
++    except (OSError, ValueError, KeyError, TypeError):
++        return None
++
++
++def run_workers(jobs, limit, environment, on_finish):
++    """Refill slots on completion; terminate all child process groups on interruption."""
++    running = {}
++    pending = iter(jobs)
++    exhausted = False
++    previous = {}
++    def interrupt(signum, frame):
++        raise KeyboardInterrupt
++    for sig in (signal.SIGINT, signal.SIGTERM):
++        previous[sig] = signal.signal(sig, interrupt)
++    try:
++        while running or not exhausted:
++            while len(running) < limit and not exhausted:
++                job = next(pending, None)
++                if job is None:
++                    exhausted = True
++                    break
++                Path(job['output']).mkdir(parents=True, exist_ok=True)
++                log = (Path(job['output']) / 'eval.log').open('a', buffering=1)
++                log.write('\n--- worker start ---\n')
++                try:
++                    proc = subprocess.Popen(job['command'], env=environment, stdout=log,
++                                            stderr=subprocess.STDOUT, start_new_session=True)
++                except BaseException:
++                    log.close()
++                    raise
++                running[proc.pid] = (proc, job, log)
++                print(f"[started] {job['metadata']['condition_id']} pid={proc.pid} log={log.name}", flush=True)
++            for pid, (proc, job, log) in list(running.items()):
++                code = proc.poll()
++                if code is None:
++                    continue
++                log.close()
++                del running[pid]
++                on_finish(job, code)
++            if running:
++                time.sleep(.2)
++    finally:
++        # Ignore additional termination signals while cleaning up children.
++        for sig in previous:
++            signal.signal(sig, signal.SIG_IGN)
++        for proc, job, log in running.values():
++            try:
++                os.killpg(proc.pid, signal.SIGTERM)
++            except ProcessLookupError:
++                pass
++        deadline = time.monotonic() + 5
++        for proc, job, log in running.values():
++            try:
++                proc.wait(timeout=max(.01, deadline - time.monotonic()))
++            except subprocess.TimeoutExpired:
++                try:
++                    os.killpg(proc.pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                proc.wait()
++            log.close()
++        for sig, handler in previous.items():
++            signal.signal(sig, handler)
++
++
++def file_identity(path):
++    path = Path(path).expanduser().resolve()
++    stat = path.stat()
++    return {'path': str(path), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
++
++
++def merge_episodes(root, jobs, completed):
++    temporary = root / 'episodes.csv.tmp'
++    with temporary.open('w', newline='') as handle:
++        writer = None
++        for job in jobs:
++            if job['metadata']['condition_id'] not in completed:
++                continue
++            with (Path(job['output']) / 'episodes.csv').open(newline='') as source:
++                reader = csv.DictReader(source)
++                if writer is None:
++                    writer = csv.DictWriter(handle, fieldnames=reader.fieldnames)
++                    writer.writeheader()
++                writer.writerows(reader)
++    temporary.replace(root / 'episodes.csv')
++
++
++def main():
++    import yaml
++    cli = parse_args()
++    config = load_yaml_config(cli.config)
++    config.pop('_config_path', None)
++    config.setdefault('training', {})['device'] = 'cuda'
++    config['retrieval']['faiss_threads'] = cli.faiss_threads
++    config['retrieval']['trace_search'] = False
++    manifest = TabxManifest(Path(config['data']['manifest']))
++    tasks = [manifest.task(t) for t in cli.task_ids] if cli.task_ids else list(manifest.tasks)
++    if not tasks or len({t.task_id for t in tasks}) != len(tasks):
++        raise ValueError('Tasks must be nonempty and unique')
++    modes = load_teammate_modes(cli.teammate_config)
++    raw_root = infer_raw_data_root(manifest, tasks, cli.raw_data_root)
++    definitions = load_task_definitions(manifest, tasks, raw_root, cli.task_package_root)
++    max_allies = cli.max_allies if cli.max_allies is not None else int(config['model'].get('max_agents', manifest.max_agents))
++    jobs, skipped = plan_conditions(tasks, definitions, modes, max_allies, cli.invalid_mode_policy)
++    for item in skipped:
++        print(f"[skip] {item['condition_id']}: {item['reason']}", flush=True)
++    print(f'[plan] tasks={len(tasks)} valid_conditions={len(jobs)} skipped={len(skipped)} '
++          f'gpu={cli.gpu_id} parallel_jobs={cli.parallel_jobs} episodes_per_condition={cli.episodes}', flush=True)
++    if not jobs:
++        raise ValueError('No valid conditions')
++    if cli.dry_run:
++        print(json.dumps([j['metadata'] for j in jobs], ensure_ascii=False, indent=2))
++        return 0
++    root = cli.output_dir.expanduser().resolve()
++    spec = json.loads(json.dumps({
++        'schema': 'tabx_parallel_v1', 'config': config,
++        'checkpoint': file_identity(cli.checkpoint / 'agent.th'),
++        'manifest': file_identity(manifest.path),
++        'normalization': file_identity(config['data']['normalization']),
++        'index_manifest': file_identity(config['retrieval']['index_manifest']),
++        'episodes': cli.episodes, 'seed': cli.seed, 'episode_limit': cli.episode_limit,
++        'capacities': [cli.max_allies, cli.max_enemies, cli.max_zones],
++        'online_memory': not cli.disable_online_memory,
++        'tabx_root': str(cli.tabx_root.resolve()), 'raw_root': str(raw_root),
++        'task_package_roots': [str(p.resolve()) for p in cli.task_package_root],
++        'definitions': {t.task_id: {'task': definitions[t.task_id].task,
++                                  'physics': definitions[t.task_id].physics_name,
++                                  'enemy': definitions[t.task_id].enemy_heuristic_name} for t in tasks},
++        'conditions': [j['metadata'] for j in jobs], 'skipped': skipped,
++    }))
++    import fcntl
++    root.mkdir(parents=True, exist_ok=True)
++    lock = (root / '.parallel.lock').open('a')
++    try:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError:
++        raise ValueError('Another parallel evaluator owns this output directory')
++    plan_path = root / 'parallel_spec.json'
++    if plan_path.exists():
++        if not cli.resume:
++            raise ValueError('Output exists; use --resume or a new --output-dir')
++        if json.loads(plan_path.read_text()) != spec:
++            raise ValueError('Parallel resume configuration/checkpoint mismatch; use a new output directory')
++    elif any(p.name != '.parallel.lock' for p in root.iterdir()):
++        raise ValueError('Output is not an empty parallel evaluation directory; choose a new directory')
++    root.mkdir(parents=True, exist_ok=True)
++    atomic_json(plan_path, spec)
++    configs = root / 'configs'
++    configs.mkdir(exist_ok=True)
++    worker_config = configs / 'evaluation.yaml'
++    worker_config.write_text(yaml.safe_dump(config, sort_keys=False))
++    for mode in modes:
++        (configs / (mode['name'] + '.yaml')).write_text(yaml.safe_dump({'teammate_modes': [mode]}, sort_keys=False))
++    environment = dict(os.environ)
++    environment.update(CUDA_VISIBLE_DEVICES=str(cli.gpu_id), JAX_PLATFORMS='cpu',
++                       JAX_DISABLE_JIT='False', XLA_PYTHON_CLIENT_PREALLOCATE='false',
++                       PYTHONUNBUFFERED='1', OMP_NUM_THREADS=str(cli.cpu_threads),
++                       MKL_NUM_THREADS=str(cli.cpu_threads), OPENBLAS_NUM_THREADS=str(cli.cpu_threads),
++                       NUMEXPR_NUM_THREADS=str(cli.cpu_threads))
++    allowed_cpus = sorted(os.sched_getaffinity(0)) if cli.cpus_per_job else []
++    if cli.cpus_per_job and not shutil.which('taskset'):
++        raise ValueError('taskset is required for CPU affinity; use --cpus-per-job 0 to disable')
++    if cli.cpus_per_job and cli.parallel_jobs * cli.cpus_per_job > len(allowed_cpus):
++        print('[cpu] Workers will share CPU cores; lower concurrency if CPU-bound', flush=True)
++    # Children see the selected physical GPU as cuda:0; each owns its model/store.
++    results, failures, pending = {}, {}, []
++    for job_number, job in enumerate(jobs):
++        job['output'] = str(root / job['directory'])
++        cmd = [sys.executable, '-u', str(ROOT / 'tools/eval_tabx_online.py'),
++               '--config', str(worker_config), '--checkpoint', str(cli.checkpoint.resolve()),
++               '--task-id', job['metadata']['task_id'], '--teammate-config',
++               str(configs / (job['mode']['name'] + '.yaml')),
++               '--episodes', str(cli.episodes), '--seed', str(cli.seed),
++               '--episode-limit', str(cli.episode_limit), '--tabx-root', str(cli.tabx_root.resolve()),
++               '--output-dir', job['output']]
++        if raw_root is not None:
++            cmd += ['--raw-data-root', str(raw_root)]
++        for p in cli.task_package_root:
++            cmd += ['--task-package-root', str(p.resolve())]
++        for name in ('allies', 'enemies', 'zones'):
++            value = getattr(cli, 'max_' + name)
++            if value is not None:
++                cmd += ['--max-' + name, str(value)]
++        if cli.disable_online_memory:
++            cmd += ['--disable-online-memory']
++        if cli.resume:
++            cmd += ['--resume']
++        if allowed_cpus:
++            count = min(cli.cpus_per_job, len(allowed_cpus))
++            cpus = [allowed_cpus[(job_number * count + i) % len(allowed_cpus)] for i in range(count)]
++            cmd = [shutil.which('taskset'), '-c', ','.join(map(str, cpus))] + cmd
++        job['command'] = cmd
++        result = completed_result(job, cli.episodes, cli.seed) if cli.resume else None
++        if result is not None:
++            results[job['metadata']['condition_id']] = result
++        else:
++            pending.append(job)
++    atomic_json(root / 'jobs.json', {'jobs': jobs, 'skipped': skipped})
++
++    def save(status):
++        rows = [dict(results[j['metadata']['condition_id']]) for j in jobs if j['metadata']['condition_id'] in results]
++        add_baseline_deltas(rows)
++        atomic_json(root / 'summary.json', {
++            'status': status, 'requested_conditions': len(jobs) + len(skipped),
++            'scheduled_conditions': len(jobs), 'completed_conditions': len(rows),
++            'failed_conditions': list(failures.values()), 'skipped_conditions': skipped,
++            'episodes_per_condition': cli.episodes, 'gpu_id': cli.gpu_id,
++            'parallel_jobs': cli.parallel_jobs, 'tasks': rows,
++        })
++        temporary = root / 'summary.csv.tmp'
++        fields = list(dict.fromkeys(k for row in rows for k in row)) or ['task_id', 'teammate_mode']
++        with temporary.open('w', newline='') as handle:
++            writer = csv.DictWriter(handle, fieldnames=fields)
++            writer.writeheader()
++            writer.writerows(rows)
++        temporary.replace(root / 'summary.csv')
++
++    def on_finish(job, code):
++        cid = job['metadata']['condition_id']
++        result = completed_result(job, cli.episodes, cli.seed) if code == 0 else None
++        if result is None:
++            failures[cid] = {'condition_id': cid, 'exit_code': code, 'log': str(Path(job['output']) / 'eval.log')}
++            print(f'[failed] {cid} exit={code}; see {failures[cid]["log"]}', flush=True)
++        else:
++            results[cid] = result
++            print(f'[complete] {cid} win_rate={result["win_rate"]:.4f} ({len(results)}/{len(jobs)})', flush=True)
++        save('running')
++
++    save('running')
++    try:
++        run_workers(pending, cli.parallel_jobs, environment, on_finish)
++    except KeyboardInterrupt:
++        save('interrupted')
++        merge_episodes(root, jobs, results)
++        return 130
++    except Exception:
++        save('failed')
++        raise
++    save('complete' if not failures else 'failed')
++    merge_episodes(root, jobs, results)
++    return 1 if failures else 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+--- /dev/null
++++ b/tests/tabx/test_parallel_eval.py
+@@ -0,0 +1,146 @@
++import csv
++import importlib.util
++import json
++import os
++from pathlib import Path
++import signal
++import sys
++from types import SimpleNamespace as NS
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++spec = importlib.util.spec_from_file_location('parallel_eval', ROOT / 'tools/eval_tabx_parallel.py')
++ev = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(ev)
++
++
++def test_plan_skips_two_ally_replacement_but_retains_baseline():
++    tasks = [NS(task_id='two'), NS(task_id='three')]
++    definitions = {t.task_id: NS(task={'scenario': {'teams': [0]*n+[1]}})
++                   for t, n in zip(tasks, [2, 3])}
++    modes = [{'name': 'all_model', 'policies': {}},
++             {'name': 'novice_0_1', 'policies': {0: 'novice', 1: 'novice'}}]
++    jobs, skipped = ev.plan_conditions(tasks, definitions, modes, 10, 'skip')
++    assert len(jobs) == 3 and len(skipped) == 1
++    assert skipped[0]['task_id'] == 'two'
++    with pytest.raises(ValueError):
++        ev.plan_conditions(tasks, definitions, modes, 10, 'error')
++
++
++def test_scheduler_limits_concurrency_and_continues_after_failure(tmp_path):
++    code = '''import json,os,sys,time
++from pathlib import Path
++start=time.monotonic()
++time.sleep(.3)
++Path(sys.argv[1]).write_text(json.dumps([start,time.monotonic(),os.environ['CUDA_VISIBLE_DEVICES']]))
++sys.exit(int(sys.argv[2]))
++'''
++    jobs = [{'metadata': {'condition_id': str(i)}, 'output': str(tmp_path / str(i)),
++             'command': [sys.executable, '-c', code, str(tmp_path / f'{i}.json'), str(i == 1 and 1 or 0)]}
++            for i in range(5)]
++    finished = []
++    ev.run_workers(jobs, 2, {**os.environ, 'CUDA_VISIBLE_DEVICES': '0'},
++                   lambda job, code: finished.append(code))
++    assert sorted(finished) == [0, 0, 0, 0, 1]
++    events = []
++    for i in range(5):
++        start, end, gpu = json.loads((tmp_path / f'{i}.json').read_text())
++        assert gpu == '0'
++        events.extend([(start, 1), (end, -1)])
++    active = peak = 0
++    for _, delta in sorted(events):
++        active += delta
++        peak = max(peak, active)
++    assert peak == 2
++
++
++def test_cleanup_reaps_other_workers_when_callback_interrupts(tmp_path):
++    jobs = [{'metadata': {'condition_id': str(i)}, 'output': str(tmp_path / str(i)),
++             'command': [sys.executable, '-c',
++                         'import os,sys,time; from pathlib import Path; '
++                         'Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(float(sys.argv[2]))',
++                         str(tmp_path / f'{i}.pid'), delay]}
++            for i, delay in enumerate(['.3', '60'])]
++    def stop(*args):
++        raise KeyboardInterrupt
++    with pytest.raises(KeyboardInterrupt):
++        ev.run_workers(jobs, 2, os.environ.copy(), stop)
++    for p in tmp_path.glob('*.pid'):
++        with pytest.raises(ProcessLookupError):
++            os.kill(int(p.read_text()), 0)
++
++
++def test_full_launch_aggregation_resume_and_mismatch(tmp_path, monkeypatch):
++    # Actual child processes, with a lightweight evaluator replacing only the
++    # GPU/model workload. Verify the real launcher CLI, artifacts and resume.
++    import yaml
++    fake_root = tmp_path / 'repo'
++    (fake_root / 'tools').mkdir(parents=True)
++    (fake_root / 'tools/eval_tabx_online.py').write_text('''
++import argparse,csv,json,os
++from pathlib import Path
++import yaml
++p=argparse.ArgumentParser()
++for k in ['config','checkpoint','task-id','teammate-config','episodes','seed','episode-limit','tabx-root','output-dir']:
++ p.add_argument('--'+k)
++p.add_argument('--resume',action='store_true')
++a,extra=p.parse_known_args()
++assert os.environ['CUDA_VISIBLE_DEVICES']=='0'
++assert os.environ['JAX_PLATFORMS']=='cpu'
++assert yaml.safe_load(Path(a.config).read_text())['training']['device']=='cuda'
++mode=yaml.safe_load(Path(a.teammate_config).read_text())['teammate_modes'][0]
++policies=mode['policies']
++meta={'task_id':a.task_id,'condition_id':json.dumps([a.task_id,mode['name']],separators=(',',':')),
++      'teammate_mode':mode['name'],'teammate_policies':json.dumps(policies,sort_keys=True),
++      'replaced_agent_ids':json.dumps(list(policies)),'replacement_count':len(policies)}
++n=int(a.episodes); seed=int(a.seed)
++r=dict(meta,episodes=n,seed_start=seed,seed_end=seed+n-1,
++       win_rate=1. if not policies else .5,mean_return=2. if not policies else 1.)
++out=Path(a.output_dir)
++(out/'summary.json').write_text(json.dumps({'status':'complete','tasks':[r]}))
++with (out/'episodes.csv').open('w',newline='') as f:
++ rows=[dict(meta,episode=i+1,seed=seed+i) for i in range(n)]
++ w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
++''')
++    config = {'data': {'manifest': str(tmp_path/'manifest.json'), 'normalization': str(tmp_path/'norm.npz')},
++              'model': {'max_agents': 10}, 'retrieval': {'index_manifest': str(tmp_path/'index.json')}}
++    for name in ['manifest.json', 'norm.npz', 'index.json', 'agent.th']:
++        (tmp_path/name).write_text('fixture')
++    cfg = tmp_path/'config.yaml'
++    cfg.write_text(yaml.safe_dump(config))
++    modes = tmp_path/'modes.yaml'
++    modes.write_text(yaml.safe_dump({'teammate_modes': [
++        {'name': 'all_model', 'policies': {}}, {'name': 'novice_0', 'policies': {0: 'novice'}}]}))
++    task = NS(task_id='task', n_agents=10)
++    monkeypatch.setattr(ev, 'ROOT', fake_root)
++    monkeypatch.setattr(ev, 'TabxManifest', lambda p: NS(tasks=[task], path=p, max_agents=10))
++    monkeypatch.setattr(ev, 'infer_raw_data_root', lambda *a: None)
++    monkeypatch.setattr(ev, 'load_task_definitions', lambda *a: {'task': NS(
++        task={'scenario': {'teams': [0,0,1]}}, physics_name='default', enemy_heuristic_name='expert')})
++    argv = ['parallel', '--config', str(cfg), '--checkpoint', str(tmp_path), '--output-dir', str(tmp_path/'out'),
++            '--teammate-config', str(modes), '--parallel-jobs', '2', '--gpu-id', '0', '--episodes', '2']
++    monkeypatch.setattr(sys, 'argv', argv)
++    assert ev.main() == 0
++    report = json.loads((tmp_path/'out/summary.json').read_text())
++    assert report['completed_conditions'] == 2
++    assert report['tasks'][1]['delta_win_rate'] == -.5
++    assert report['tasks'][1]['delta_mean_return'] == -1.
++    monkeypatch.setattr(sys, 'argv', argv + ['--resume'])
++    def no_spawn(jobs, *args):
++        assert jobs == []
++    original_runner = ev.run_workers
++    monkeypatch.setattr(ev, 'run_workers', no_spawn)
++    assert ev.main() == 0
++    with (tmp_path/'out/episodes.csv').open() as f:
++        assert len(list(csv.DictReader(f))) == 4
++    history = next((tmp_path/'out').glob('condition_*/episodes.csv'))
++    history.write_text(history.read_text().splitlines()[0] + '\n')
++    def restart_one(jobs, *args):
++        assert len(jobs) == 1
++        return original_runner(jobs, *args)
++    monkeypatch.setattr(ev, 'run_workers', restart_one)
++    assert ev.main() == 0
++    (tmp_path/'agent.th').write_text('different checkpoint')
++    with pytest.raises(ValueError, match='mismatch'):
++        ev.main()
+--- /dev/null
++++ b/docs/TABX_PARALLEL_EVAL.md
+@@ -0,0 +1,73 @@
++# 同一 GPU 上并行评估 TABX
++
++在 `codex/tabx-maicc-baseline-fixes` 使用 `eval-parallel`。保留此前 padding 比例修复和
++`Zone.act` 的 `@jax.jit` 修复；本功能不修改模型或重新构建索引。
++
++```bash
++bash tools/run_tabx_baseline_retrain.sh eval-parallel \
++  --gpu-id 0 \
++  --parallel-jobs 32 \
++  --cpus-per-job 2 \
++  --raw-data-root "$TABX_RAW_ROOT" \
++  --teammate-config src/config/tabx/teammate_modes.yaml \
++  --episodes 100 --seed 10000 \
++  --output-dir "$MAICC_RUN_DIR/eval_parallel_gpu0_32"
++```
++
++在重训的 Python 环境中运行，并保留正确的 `MAICC_DATA_DIR`、`MAICC_RUN_DIR` 和
++`MAICC_SEED`。默认加载 `$MAICC_RUN_DIR/stage1/step_000100000`；可以用 `--checkpoint`
++覆盖。不传 `--teammate-config` 时只测 all_model。可以传之前的单队友配置。
++
++## 并行和记忆语义
++
++一个工作进程负责一个「任务 × 队友模式」，完整运行该条件的所有 episodes。
++同一条件内 episode 串行，在线 memory 正常积累；条件之间进程隔离、memory 从空开始。
++不是把一个条件的 100 个 episode 分给 32 个进程。
++
++调度器最多同时运行 `--parallel-jobs` 个进程，空闲位置自动补充下一个条件。
++每个子进程使用 `CUDA_VISIBLE_DEVICES=0`（由 --gpu-id 决定），PyTorch 使用可见的
++`cuda:0`；JAX 使用 CPU 且启用 JIT。每个子进程各自持有模型和 FAISS 检索库。
++所有条件使用同一 seed 序列，不因调度顺序不同而改变。
++
++`--cpus-per-job 2` 默认将工作进程绑定到父进程允许的两个逻辑 CPU，限制 JAX 的
++线程扩张；依赖 Linux taskset。CPU 不够时会共享核心并打印提示。设为 0 可关闭绑定。
++`--cpu-threads 1` 设置 BLAS/OpenMP 线程数，`--faiss-threads 1` 设置 FAISS 线程数。
++CPU 核心分配按条件编号轮换，动态调度过程中可能共享核心，不保证独占。
++
++800 MiB 单进程显存是测得的某一时刻占用，不是峰值承诺。32 路名义上约 25 GiB 显存，
++但还要为检索、长上下文和在线 memory 留空间。按此前约 13 GiB 的单进程主机内存，
++32 路可能需要约 400 GiB RAM。总速度也受 CPU、索引加载和内存带宽影响。
++可以先 --parallel-jobs 4 --episodes 2 使用独立短跑目录，再增加并发。
++
++## 无效条件
++
++默认 `--invalid-mode-policy skip`：例如两个 ally 的任务不运行双队友替换，
++但仍运行 all_model 和有效的单队友替换。跳过条件、原因会打印并写入 summary.json
++的 skipped_conditions；不会改变指定替换位置、不会偷偷减少替换人数。
++设为 error 可恢复严格报错。有效双替换任务数与全部任务数不同，比较时按同任务
++all_model 的 delta 指标分析。
++
++只查看任务计划、不启动 GPU/模型或写文件：在原命令后加 `--dry-run`。
++
++## 输出和恢复
++
++- summary.csv / summary.json：所有已完成条件及相对同任务 all_model 的差值。
++  all_model 尚未完成时差值为空，完成后更新。跳过和失败单独记录。
++- episodes.csv：全部已完成条件的回合数据，在调度结束或收到中断后合并。
++- condition_<hash>/eval.log：每个工作进程的独立日志，立即写入，不等全部完成。
++- condition_<hash>/episodes.csv、summary.json：原始单条件结果。
++- jobs.json：任务、模式、目录、实际工作命令之间的对应表。
++- parallel_spec.json：用于校验恢复运行的数据、配置和 checkpoint 身份。
++- configs/：展开环境变量后的评估配置，以及每个模式的独立配置。
++
++中断后在同一命令末尾加 `--resume`。已完成且回合记录完整的条件无需加载模型，直接
++跳过；未完成条件从头重跑，避免丢失在线 memory。允许在恢复时调整 GPU、并发数量和
++CPU 绑定；改变模型、数据、模式、episodes 或 FAISS 配置时使用新目录。
++不能直接把旧串行评估目录作为并行输出目录。
++
++一个条件失败不会取消其他条件；最终退出码为非零，并在 summary.json 列出失败日志。
++Ctrl-C/终止信号会结束该调度器启动的工作进程组并等待回收。输出目录有互斥锁，防止
++两个调度器同时写同一个目录。不要手动删除正在运行的输出目录。
++
++本地测试使用真实子进程验证并发上限、失败后继续、子进程清理、聚合、跳过不适用条件
++以及断点续跑。未在用户的 80G GPU 上实测 32 路吞吐量或显存峰值。

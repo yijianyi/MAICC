@@ -1,0 +1,13 @@
+--- a/TABX/src/tabx/tabx.py
++++ b/TABX/src/tabx/tabx.py
+@@ -173,6 +173,10 @@
+     ellipse: Ellipse  # The parameter of ellipse
+     effect_value: chex.Array  # The damage dealt by the lava zone
+ 
++    # Zone is a Flax pytree: keep self dynamic so changing zone parameters or
++    # world values reuses the executable. Without this stable boundary, eager
++    # lax.switch captures fresh bound methods/constants and recompiles per call.
++    @jax.jit
+     def act(self, objects, physics_params):
+         return jax.lax.switch(
+             self.zone_type.reshape(),
