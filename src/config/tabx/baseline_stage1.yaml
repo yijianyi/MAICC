@@ -22,9 +22,9 @@ model:
 training:
   device: auto
   seed: ${MAICC_SEED}
-  total_steps: 100000
+  total_steps: 500000
   max_batch_size: 32
-  agent_time_budget: 4096
+  agent_time_budget: 32000
   learning_rate: 0.0005
   grad_norm_clip: 10.0
   use_amp: false
@@ -55,7 +55,7 @@ retrieval:
   index_factory: HNSW32,Flat
   index_batch_rows: 8
   max_index_rows_per_task: 0
-  stage0_checkpoint: ${MAICC_RUN_DIR}/stage0/step_000100000
+  stage0_checkpoint: ${MAICC_RUN_DIR}/stage0/step_000500000
   index_dir: ${MAICC_RUN_DIR}/retrieval
   index_manifest: ${MAICC_RUN_DIR}/retrieval/retrieval_manifest.json
   utility_alpha: 0.8
