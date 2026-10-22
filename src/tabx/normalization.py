@@ -43,6 +43,7 @@ class ObservationNormalizer:
             payload = np.load(path, allow_pickle=False)
             mean = np.asarray(payload["mean"], dtype=np.float32)
             scale = np.asarray(payload["scale"], dtype=np.float32)
+            fit_split = str(payload["fit_split"].item()) if "fit_split" in payload else None
             stored_manifest_hash = (
                 str(payload["manifest_sha256"].item())
                 if "manifest_sha256" in payload
@@ -57,6 +58,13 @@ class ObservationNormalizer:
                 f"Normalization shape mismatch: mean={mean.shape}, "
                 f"scale={scale.shape}, expected {(obs_dim,)}"
             )
+        if fit_split not in (None, "train"):
+            raise NormalizationError("Baseline normalization must be fitted on split=train")
+        if fit_split is None and manifest_path is not None:
+            import json
+            tasks = json.loads(Path(manifest_path).read_text())["tasks"]
+            if any(task.get("split", "train") != "train" for task in tasks):
+                raise NormalizationError("Recompute legacy normalization with --split train for a held-out-task manifest")
         if not np.isfinite(mean).all() or not np.isfinite(scale).all():
             raise NormalizationError("Normalization contains NaN or Inf")
         if np.any(np.abs(mean) > 1e-8):

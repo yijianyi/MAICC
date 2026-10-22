@@ -29,11 +29,17 @@ def main():
         manifest.validate_files(manifest.tasks_for_split("train"))
     budget = int(config["training"].get("agent_time_budget", 0))
     cap = int(config["training"]["max_batch_size"])
-    batch = min(cap, max(1, budget // (manifest.max_agents * manifest.sequence_length))) if budget > 0 else cap
+    micro_batch = min(cap, max(1, budget // (manifest.max_agents * manifest.sequence_length))) if budget > 0 else cap
+    prefix_vectors = sum(t.n_trajectories * t.n_agents * t.sequence_length
+                         for t in manifest.tasks_for_split("train"))
     print(json.dumps(dict(tasks=len(manifest.tasks_for_split("train")), obs_dim=manifest.obs_dim,
         max_agents=args.n_agents, max_enemies=args.max_enemies, n_zones=args.n_zones,
         other_unit_blocks=args.obs_other_blocks, sequence_length=manifest.sequence_length,
-        effective_batch_at_capacity=batch, data_manifest_sha256=file_sha256(manifest.path),
+        cem_architecture=args.cem_architecture, effective_batch=cap,
+        micro_batch_at_capacity=micro_batch, accumulation_steps=(cap+micro_batch-1)//micro_batch,
+        sampled_windows_per_stage=cap*int(config["training"]["total_steps"]),
+        exact_index_bytes_upper_bound=prefix_vectors*(4*args.n_embd+30),
+        data_manifest_sha256=file_sha256(manifest.path),
         normalization_sha256=file_sha256(data["normalization"])), indent=2))
     print("Preflight passed. Task/record test splits must be specified separately for paper evaluation.")
 

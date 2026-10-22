@@ -125,6 +125,7 @@ def main() -> int:
         mean=mean,
         scale=scale,
         mode=np.asarray("scale_only"),
+        fit_split=np.asarray(cli.split),
         statistic=np.asarray("global_random_sample_abs_p99"),
         count=np.asarray(count, dtype=np.int64),
         sample_count=np.asarray(sample_count, dtype=np.int64),

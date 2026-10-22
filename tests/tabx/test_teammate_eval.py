@@ -104,7 +104,7 @@ class TeammateTests(unittest.TestCase):
         except ImportError:
             self.skipTest('PyTorch unavailable')
         context_actions, stored_actions = [], []
-        mac = NS(agent=object(), init_hidden=lambda n: None,
+        mac = NS(agent=object(), args=NS(online_return_scale=1.), init_hidden=lambda n: None,
                  select_actions=lambda *a, **kw: torch.tensor([[1, 1, 1, 1]]),
                  update_context=lambda batch, t: context_actions.append(batch['actions'][0, t].cpu().numpy().reshape(-1)))
         store = NS(offline_probability=1.,
@@ -147,7 +147,9 @@ class TeammateTests(unittest.TestCase):
         mac = NS(agent=agent, load_models=Mock(), init_hidden=Mock(),
                  select_actions=lambda *a, **kw: torch.tensor([[1, 1, 1, 1]]),
                  update_context=lambda *a: None)
-        task = NS(task_id='t', n_agents=4, obs_dim=2, action_dim=8, return_scale=1., target_return=1.)
+        task = NS(task_id='t', n_agents=4, obs_dim=2, action_dim=8, return_scale=1., target_return=1., split='train')
+        model_args = NS(k=2, l=4, max_similarity=.98)
+        mac.args = model_args
         definition = NS(task={'scenario': {'teams': [0, 0, 0, 1]}},
                         path=Path('task.json'), physics_name='default', enemy_heuristic_name='expert')
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -163,12 +165,13 @@ class TeammateTests(unittest.TestCase):
             replacements = {
                 'parse_args': lambda: cli, 'load_yaml_config': lambda p: config,
                 'load_teammate_modes': lambda p: modes,
-                'TabxManifest': lambda p: NS(tasks=[task], obs_dim=2, path=p),
+                'TabxManifest': lambda p: NS(tasks=[task], obs_dim=2, path=p, tasks_for_split=lambda split: [task]),
+                'file_sha256': lambda path: 'fixture-hash',
                 'infer_raw_data_root': lambda *a: root,
                 'load_task_definitions': lambda **kw: {'t': definition},
                 'ObservationNormalizer': NS(load=lambda *a, **kw: NS(apply=lambda x: x)),
                 'select_device': lambda x: 'cpu',
-                'create_model_and_learner': lambda *a: (NS(k=2, l=4), mac, None, None),
+                'create_model_and_learner': lambda *a: (model_args, mac, None, None),
                 'TabxRetrievalStore': lambda **kw: store,
                 'build_environment': lambda **kw: TabxOnlineWrapper(FakeEnv(), {}, seed=kw['seed']),
             }

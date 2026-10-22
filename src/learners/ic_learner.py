@@ -43,20 +43,29 @@ class ICLearner:
         if not self.params:
             raise RuntimeError(f"No trainable parameters for train_mode={train_mode}")
         self.optimiser = Adam(params=self.params, lr=self.args.lr)
+        self._accumulating = False
+        self._loss_weight = 1.0
+        self._finish_update = True
 
     def _optimise(self, loss: th.Tensor) -> None:
         if not th.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {loss.detach().cpu()}")
-        self.optimiser.zero_grad(set_to_none=True)
-        self.scaler.scale(loss).backward()
+        if not self._accumulating:
+            self.optimiser.zero_grad(set_to_none=True)
+        self.scaler.scale(loss * self._loss_weight).backward()
+        if not self._finish_update:
+            self._accumulating = True
+            return
         self.scaler.unscale_(self.optimiser)
+        limit = float(getattr(self.args, "grad_norm_clip", 0.0))
         grad_norm = clip_grad_norm_(
-            self.params, float(getattr(self.args, "grad_norm_clip", 10.0))
+            self.params, limit if limit > 0 else float("inf")
         )
         if not math.isfinite(float(grad_norm)):
             raise FloatingPointError(f"Non-finite gradient norm: {grad_norm}")
         self.scaler.step(self.optimiser)
         self.scaler.update()
+        self._accumulating = False
 
     def _sequences(self, batch: EpisodeBatch):
         obs = batch["obs"][:, :-1]
@@ -83,9 +92,12 @@ class ICLearner:
         returns = th.cumsum(reward, dim=1)
         return rtg, obs, action, post, returns, mask, present
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, buffer, train_mode):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, buffer, train_mode,
+              loss_weight: float = 1.0, finish_update: bool = True):
         if train_mode != self.train_mode:
             self.configure_train_mode(train_mode)
+        self._loss_weight = float(loss_weight)
+        self._finish_update = bool(finish_update)
         if train_mode == 1:
             # A stationary FAISS space requires deterministic frozen encoders,
             # not just requires_grad=False. Keep dropout only in the policy.
@@ -153,8 +165,8 @@ class ICLearner:
                 else:
                     loss = dem_action + dem_obs
             self._optimise(loss)
-            self.training_steps += 1
-            if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.training_steps += int(finish_update)
+            if finish_update and t_env - self.log_stats_t >= self.args.learner_log_interval:
                 if self.args.train_CEM:
                     for key, value in (
                         ("CEM_action_loss", cem_action),
@@ -187,16 +199,25 @@ class ICLearner:
             if max_valid <= 0:
                 continue
             rand_t = random.randint(1, min(seq_len, max_valid))
-            query_mask = agent_mask[:, :rand_t]
+            # Rows ending before the sampled target do not contribute DT loss
+            # and must not issue a query at a different actual prefix length.
+            query_rows = (th.nonzero(valid_lengths >= rand_t, as_tuple=False).flatten()
+                          if self.args.env == "tabx" else th.arange(_batch_size, device=seq_obs.device))
+            query_mask = agent_mask[query_rows, :rand_t]
             with th.no_grad():
                 query_embedding = self.mac.agent.get_dem_traj_embedding(
-                    seq_rtg[:, :rand_t], policy_obs[:, :rand_t, agent_id],
-                    seq_action[:, :rand_t, agent_id], seq_post[:, :rand_t],
+                    seq_rtg[query_rows, :rand_t], policy_obs[query_rows, :rand_t, agent_id],
+                    seq_action[query_rows, :rand_t, agent_id], seq_post[query_rows, :rand_t],
                     query_mask,
                 )[0].cpu().numpy()
-            retrieval = buffer.mips(
-                query_embedding, rand_t - 1, query_return=seq_ret[:, -1]
-            )
+            if self.args.env == "tabx":
+                # The store uses full source-episode returns bound to these
+                # sampled rows; seq_ret would only be a window return.
+                retrieval = buffer.mips(query_embedding, rand_t - 1,
+                                        query_indices=query_rows.cpu().numpy())
+            else:
+                retrieval = buffer.mips(query_embedding, rand_t - 1,
+                                        query_return=seq_ret[query_rows, -1])
             if len(retrieval) == 7:
                 co, cr, ca, ct, cm, context_rtg, context_completion = retrieval
             else:
@@ -215,19 +236,20 @@ class ICLearner:
             with autocast(enabled=self.use_amp):
                 agent_loss = self.mac.agent.train_DT(
                     context_rtg, co, ca.squeeze(-1), context_post, cm,
-                    seq_rtg[:, :rand_t], policy_obs[:, :rand_t, agent_id],
-                    seq_action[:, :rand_t, agent_id], seq_post[:, :rand_t],
+                    seq_rtg[query_rows, :rand_t], policy_obs[query_rows, :rand_t, agent_id],
+                    seq_action[query_rows, :rand_t, agent_id], seq_post[query_rows, :rand_t],
                     query_mask,
                 )
             losses.append(agent_loss)
 
         if not losses:
             raise RuntimeError("No present TABX agents were available for DT loss")
-        # Mean over valid agents keeps gradient scale stable from 10 to 20 slots.
-        dt_loss = th.stack(losses).mean()
+        dt_loss = th.stack(losses).sum()
+        if getattr(self.args, "dt_loss_reduction", "sum") == "mean":
+            dt_loss = dt_loss / len(losses)
         self._optimise(dt_loss)
-        self.training_steps += 1
-        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+        self.training_steps += int(finish_update)
+        if finish_update and t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("DT_loss", float(dt_loss), t_env)
             self.log_stats_t = t_env
         return {"DT_loss": float(dt_loss.detach().cpu())}

@@ -44,12 +44,14 @@ def encoder_sha256(state):
 def write_training_provenance(directory, config, manifest, agent):
     payload = source_identity()
     payload.update({
-        "schema": "tabx_baseline_provenance_v1",
+        "schema": "tabx_baseline_provenance_v2",
         "encoder_sha256": encoder_sha256(agent.state_dict()),
         "data_manifest_sha256": file_sha256(manifest.path),
         "normalization_sha256": (file_sha256(config["data"]["normalization"])
                                  if config["data"].get("normalization") else None),
-        "cem_history": "shifted_post_v1",
+        "cem_architecture": config.get("model", {}).get("cem_architecture", "dense"),
+        "retrieval_protocol": "maicc_local_exact_prefix_v4",
+        "context_length": manifest.sequence_length,
     })
     (Path(directory) / "provenance.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n")

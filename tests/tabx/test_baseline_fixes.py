@@ -13,7 +13,8 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 from modules.agents.tabx_transformer_agent import FactorizedCEM
 from tabx.observation_layout import ObservationLayout
 from tabx.episode_utility import episode_cover
-from tabx.retrieval_store import hybrid_scores, TabxRetrievalStore, RetrievalBucket
+from tabx.retrieval_store import (offline_scores, online_scores, training_scores,
+                                  TabxRetrievalStore, RetrievalBucket, RetrievalError)
 
 torch.set_num_threads(1)
 
@@ -79,19 +80,23 @@ def test_utility_retrieval_training_exclusion_and_online_ranking():
     store.faiss = faiss
     store.embedding_dim = 2
     store.k = 1
-    store.search_k = store.online_search_k = 3
+    store.search_k = 3
     store._query_record_hashes = np.array([10], np.uint64)
     store._offline_search_calls = 0
     store.trace_search = False
     store.use_utility = True
-    store.utility_alpha = .8
-    store._combined_utility_bounds = {"team": [0, 1], "individual": [0, 1]}
+    store.weight = .8
+    store.return_bounds = (0, 1)
+    store.max_similarity = .98
+    store.rng = np.random.default_rng(7)
     bucket = RetrievalBucket(0, index, np.zeros(3), np.arange(3), np.zeros(3),
                              np.array([10, 20, 30]), np.array([1, 0, 1]), np.array([1, 0, 1]))
     query = np.array([[1, 0]], np.float32)
-    assert store._select_candidates(bucket, query, None) == [[1]]
-    assert store._select_candidates(bucket, query, None, test_mode=True) == [[2]]
-    scores = hybrid_scores([.9, .95], [1, 0], [1, 0], .8, store._combined_utility_bounds)
+    assert store._select_candidates(bucket, query, np.array([0.]),
+        query_record_hashes=store._query_record_hashes) == [[1]]
+    assert store._select_candidates(bucket, query, None, test_mode=True,
+        query_record_hashes=store._query_record_hashes) == [[2]]
+    scores = offline_scores([.9, .95], [1, 0], store.return_bounds)
     assert scores[0] > scores[1]
 
 
@@ -143,9 +148,9 @@ def test_two_stage_pipeline_and_index_identity(tmp_path, monkeypatch):
     config = dict(data=dict(manifest=str(manifest_path), normalization=str(norm_path)),
         model=dict(agent="tabx_transformer", max_agents=2, max_enemies=2, n_zones=1,
                    n_embd=16, n_layer=2, n_head=2, hidden_dim=16, dropout=.1, train_cem=True),
-        training=dict(total_steps=2, max_batch_size=2, seed=7, save_interval=2,
+        training=dict(total_steps=2, max_batch_size=2, agent_time_budget=8, seed=7, save_interval=2,
                       output_dir=str(tmp_path / "stage0"), device="cpu"),
-        retrieval=dict(k=2, search_k=8, index_factory="Flat", history_buckets=[1, 4],
+        retrieval=dict(k=2, search_k=8, index_factory="Flat",
                        index_batch_rows=2, index_dir=str(tmp_path / "index")))
     c0 = run_stage0(config, manifest_path, norm_path, "cpu")
     config["retrieval"].update(stage0_checkpoint=str(c0), index_manifest=str(tmp_path / "index/retrieval_manifest.json"))
@@ -171,12 +176,17 @@ def test_two_stage_pipeline_and_index_identity(tmp_path, monkeypatch):
     assert load_checkpoint(c1, learner, "cpu") == 2
     mac.agent.load_state_dict(b)
     kwargs = dict(index_manifest=index_path, data_manifest=manifest, normalizer=normalizer,
-                  k=2, search_k=8, device="cpu", enable_online_memory=True,
+                  k=2, search_k=8, device="cpu", enable_online_memory=True, index_cache_size=1,
                   normalization_path=norm_path, expected_encoder_sha256=encoder_sha256(b))
     from tabx.retrieval_store import RetrievalError
     with pytest.raises(RetrievalError, match="encoder hash"):
         TabxRetrievalStore(**{**kwargs, "expected_encoder_sha256": "wrong"})
     store = TabxRetrievalStore(**kwargs)
+    # Every prefix includes both beginning and intermediate windows; the LRU
+    # bounds index residency without dropping candidates.
+    for anchor in range(4):
+        assert store._bucket(anchor).index.ntotal == 12
+        assert len(store.buckets) == 1
     source = TabxEpisodeSource(manifest, normalizer=normalizer)
     batch = source.load_rows(manifest.tasks[0], [0, 2]).batch
     store.begin_query_batch("task", [0, 2])
@@ -191,8 +201,14 @@ def test_two_stage_pipeline_and_index_identity(tmp_path, monkeypatch):
     store.add_completed_online_episode(mac.agent, obs, actions[:, :, 0], reward,
         np.array([[0]]*5+[[1]]), np.array([[0]]*5+[[1]]), np.array([1, 1]), rtg)
     assert store.completed_online_episodes == 1
-    assert all(abs(t-.21) < 1e-6 for pairs in store._online_returns.values() for t, _ in pairs)
-    assert store._online_mips(key1[:1].numpy(), 3) is not None
+    assert all(abs(item[0]-.21) < 1e-6 for pairs in store._online_returns.values() for item in pairs)
+    assert store.offline_probability == 1.0
+    assert store._online_mips(key1[:1].numpy(), 3, 0) is None
+    store.add_completed_online_episode(mac.agent, obs, actions[:, :, 0], reward,
+        np.array([[0]]*5+[[1]]), np.array([[0]]*5+[[1]]), np.array([1, 1]), rtg)
+    assert store._online_mips(key1[:1].numpy(), 3, 0) is not None
+    with pytest.raises(RetrievalError, match="prefix"):
+        store.mips(key1[:1].numpy(), 4, test_mode=True, agent_ids=[0])
     store.reset_online_memory()
     assert store.completed_online_episodes == 0
     assert all(not pairs for pairs in store._online_returns.values())

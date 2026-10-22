@@ -1,4 +1,4 @@
-"""TABX TransformerAgent with a factorized centralized embedding model."""
+"""TABX adapter; dense MAICC CEM by default, factorized CEM as an ablation."""
 
 from __future__ import annotations
 
@@ -228,16 +228,21 @@ class FactorizedCEM(nn.Module):
 
 
 class TabxTransformerAgent(TransformerAgent):
-    """Drop-in TransformerAgent that only replaces the unsafe dense CEM."""
+    """Keep the original CEM unless a factorized ablation is explicit."""
 
     def __init__(self, input_shape, args, env_info):
         super().__init__(input_shape, args, env_info)
-        self.CEM = FactorizedCEM(
-            n_embd=self.n_embd,
-            n_layer=self.n_layer,
-            n_head=self.n_head,
-            dropout=self.dropout,
-            max_agents=self.max_agents,
-            max_timesteps=self.traj_len,
-            use_rtg=self.args.use_rtg,
-        )
+        architecture = getattr(args, "cem_architecture", "dense")
+        if architecture == "factorized":
+            self.CEM = FactorizedCEM(
+                n_embd=self.n_embd, n_layer=self.n_layer,
+                n_head=self.n_head, dropout=self.dropout,
+                max_agents=self.max_agents, max_timesteps=self.traj_len,
+                use_rtg=self.args.use_rtg,
+            )
+        elif architecture != "dense":
+            raise ValueError(f"Unknown CEM architecture: {architecture}")
+        if getattr(args, "gradient_checkpointing", False):
+            for model in (self.CEM, self.DEM, self.DT):
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()

@@ -1,5 +1,11 @@
 # TABX → MAICC server training
 
+This is the historical 7-task data preparation guide. For the current `train_0`
+baseline, configuration, retraining and evaluation protocol, use
+[TABX_BASELINE_RETRAIN.md](TABX_BASELINE_RETRAIN.md). Its instructions supersede
+the older training settings below; visible-observation weighting now defaults to
+1, CEM is dense, and retrieval requires a newly built v4 index.
+
 This implementation uses the 7-task raw data at:
 
 ```text

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -31,275 +32,232 @@ class RetrievalBucket:
 
 
 def normalized_utility(values, bounds):
+    """Original affine return normalization; fixed bounds, no clipping."""
     values = np.asarray(values, dtype=np.float32)
     lower, upper = map(float, bounds)
     if upper <= lower:
         return np.zeros_like(values)
-    return np.clip((values - lower) / (upper - lower), 0.0, 1.0)
+    return (values - lower) / (upper - lower)
 
 
-def hybrid_scores(similarity, team_return, individual_return, alpha, bounds):
-    return (np.asarray(similarity) + alpha * normalized_utility(team_return, bounds["team"])
-            + (1.0 - alpha) * normalized_utility(individual_return, bounds["individual"]))
+def offline_scores(similarity, team_return, bounds, weight=0.8):
+    return (np.asarray(similarity) + 1.0) / 2.0 + weight * normalized_utility(team_return, bounds)
+
+
+def online_scores(similarity, team_return, individual_return, n_agents,
+                  bounds, weight=0.8, ind_weight=0.2):
+    return (offline_scores(similarity, team_return, bounds, weight)
+            + ind_weight * normalized_utility(np.asarray(individual_return) * n_agents, bounds))
+
+
+def training_scores(similarity, candidate_return, query_return, max_similarity):
+    similarity = np.asarray(similarity)
+    bonus = (similarity < max_similarity) & (np.asarray(candidate_return) <= query_return)
+    return (similarity + 1.0) / 2.0 + bonus.astype(np.float32)
 
 
 class TabxRetrievalStore:
-    """Persistent FAISS retrieval with lazy HDF5 context loading."""
+    """Exact-prefix retrieval and agent-local online memory.
 
-    def __init__(
-        self,
-        index_manifest: Path,
-        data_manifest: TabxManifest,
-        normalizer: ObservationNormalizer,
-        k: int,
-        search_k: int,
-        device: str,
-        online_search_k: int = 16,
-        seed: int = 0,
-        h5_lru_size: int = 16,
-        enable_online_memory: bool = False,
-        test_nepisode: int = 100,
-        index_load_mode: str = "ram",
-        faiss_threads: int = 4,
-        trace_search: bool = False,
-        utility_alpha: float = 0.8,
-        use_utility: bool = True,
-        expected_encoder_sha256: Optional[str] = None,
-        normalization_path: Optional[Path] = None,
-    ):
-        try:
-            import faiss
-            import h5py
-        except ImportError as exc:
-            raise RetrievalError(
-                "faiss and h5py are required for TABX stage-1 training"
-            ) from exc
-        self.faiss = faiss
-        self.h5py = h5py
-        self.index_manifest_path = index_manifest.expanduser().resolve()
-        try:
-            payload = json.loads(
-                self.index_manifest_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RetrievalError(
-                f"Cannot read retrieval manifest {self.index_manifest_path}: {exc}"
-            ) from exc
-        if payload.get("schema") != "tabx_retrieval_index_v3":
-            raise RetrievalError(
-                f"Unsupported retrieval schema: {payload.get('schema')!r}"
-            )
-        if int(payload["embedding_dim"]) <= 0:
-            raise RetrievalError("Invalid retrieval embedding dimension")
-        if int(payload["sequence_length"]) != data_manifest.sequence_length:
-            raise RetrievalError(
-                "Retrieval index and data manifest sequence lengths differ"
-            )
-        self.embedding_dim = int(payload["embedding_dim"])
+    Offline indexes are loaded on demand. The LRU bounds memory even when all
+    history lengths are indexed; it does not change the candidate set.
+    """
+
+    def __init__(self, index_manifest: Path, data_manifest: TabxManifest,
+                 normalizer: ObservationNormalizer, k: int, search_k: int,
+                 device: str, seed: int = 0, h5_lru_size: int = 16,
+                 enable_online_memory: bool = False, test_nepisode: int = 100,
+                 index_load_mode: str = "ram", faiss_threads: int = 4,
+                 trace_search: bool = False, use_utility: bool = True,
+                 weight: float = 0.8, ind_weight: float = 0.2,
+                 max_similarity: float = 0.98, index_cache_size: int = 2,
+                 allow_approximate_index: bool = False,
+                 expected_encoder_sha256: Optional[str] = None,
+                 normalization_path: Optional[Path] = None):
+        import faiss
+        import h5py
         from .provenance import file_sha256
+
+        self.faiss, self.h5py = faiss, h5py
+        self.index_manifest_path = Path(index_manifest).expanduser().resolve()
+        payload = json.loads(self.index_manifest_path.read_text(encoding="utf-8"))
+        if payload.get("schema") != "tabx_retrieval_index_v4":
+            raise RetrievalError("Rebuild the index with schema v4; v3 retrieval semantics are incompatible")
+        if payload.get("prefix_policy") != "exact_all_windows":
+            raise RetrievalError("Index must contain exact prefixes from all eligible windows")
+        if payload.get("index_factory") != "Flat" and not allow_approximate_index:
+            raise RetrievalError("Approximate index requires explicit allow_approximate_index=true")
         if payload.get("data_manifest_sha256") != file_sha256(data_manifest.path):
             raise RetrievalError("Index data manifest hash mismatch; rebuild the index")
         if normalization_path is not None and payload.get("normalization_sha256") != file_sha256(normalization_path):
             raise RetrievalError("Index normalization hash mismatch; rebuild the index")
         if expected_encoder_sha256 is not None and payload.get("encoder_sha256") != expected_encoder_sha256:
             raise RetrievalError("Index encoder hash mismatch; rebuild the index")
-        if not 0 <= utility_alpha <= 1:
-            raise RetrievalError("utility_alpha must be in [0, 1]")
-        self.utility_alpha = float(utility_alpha)
-        self.use_utility = bool(use_utility)
-        self.utility_bounds = payload["utility_bounds"]
-        for limits in self.utility_bounds.values():
-            if len(limits) != 2 or not np.isfinite(limits).all() or limits[0] > limits[1]:
-                raise RetrievalError("Invalid utility normalization bounds")
+        self.embedding_dim = int(payload["embedding_dim"])
+        self.context_length = int(payload["sequence_length"])
+        if self.embedding_dim <= 0 or self.context_length != data_manifest.sequence_length:
+            raise RetrievalError("Invalid index dimensions or context length")
         self.k = int(k)
+        if self.k < 1:
+            raise RetrievalError("k must be positive")
         self.search_k = max(int(search_k), self.k)
-        self.online_search_k = max(int(online_search_k), self.k)
         self.device = device
         self.rng = np.random.default_rng(seed)
         self.enable_online_memory = bool(enable_online_memory)
         self.test_nepisode = max(1, int(test_nepisode))
-        self.completed_online_episodes = 0
-        self.index_load_mode = str(index_load_mode).strip().lower()
+        self.weight, self.ind_weight = float(weight), float(ind_weight)
+        self.max_similarity = float(max_similarity)
+        self.use_utility = bool(use_utility)
+        self.return_bounds = tuple(map(float, payload["utility_bounds"]["team"]))
+        if len(self.return_bounds) != 2 or not np.isfinite(self.return_bounds).all() or self.return_bounds[0] > self.return_bounds[1]:
+            raise RetrievalError("Invalid fixed training-return bounds")
+        self.index_load_mode = str(index_load_mode)
         if self.index_load_mode not in {"ram", "mmap"}:
-            raise RetrievalError(
-                "index_load_mode must be either 'ram' or 'mmap', got "
-                f"{index_load_mode!r}"
-            )
-        self.faiss_threads = max(1, int(faiss_threads))
+            raise RetrievalError("index_load_mode must be ram or mmap")
+        self.index_cache_size = max(1, int(index_cache_size))
         self.trace_search = bool(trace_search)
-        self._offline_search_calls = 0
-        if hasattr(faiss, "omp_set_num_threads"):
-            faiss.omp_set_num_threads(self.faiss_threads)
+        faiss.omp_set_num_threads(max(1, int(faiss_threads)))
         self.tasks = tuple(data_manifest.tasks)
-        self.source = TabxEpisodeSource(
-            manifest=data_manifest,
-            split="train",
-            normalizer=normalizer,
-            seed=seed,
-            h5_lru_size=h5_lru_size,
-        )
-        self.buckets: Dict[int, RetrievalBucket] = {}
-        base = self.index_manifest_path.parent
-        for item in payload.get("buckets", []):
-            anchor = int(item["anchor"])
-            index_path = base / str(item["index_file"])
-            metadata_path = base / str(item["metadata_file"])
-            started = time.perf_counter()
-            if self.index_load_mode == "ram":
-                index = faiss.read_index(str(index_path))
-            else:
-                mmap_flags = int(getattr(faiss, "IO_FLAG_MMAP", 0)) | int(
-                    getattr(faiss, "IO_FLAG_READ_ONLY", 0)
-                )
-                try:
-                    index = faiss.read_index(str(index_path), mmap_flags)
-                except TypeError:
-                    index = faiss.read_index(str(index_path))
-            elapsed = time.perf_counter() - started
-            size_gib = index_path.stat().st_size / float(1024 ** 3)
-            print(
-                "[retrieval-index] "
-                f"anchor={anchor} mode={self.index_load_mode} "
-                f"size_gib={size_gib:.3f} vectors={int(index.ntotal)} "
-                f"load_seconds={elapsed:.3f} threads={self.faiss_threads}",
-                flush=True,
-            )
-            with h5py.File(str(metadata_path), "r") as handle:
-                task_index = np.asarray(handle["task_index"][:], dtype=np.int32)
-                row = np.asarray(handle["row"][:], dtype=np.int64)
-                agent_id = np.asarray(handle["agent_id"][:], dtype=np.int16)
-                record_hash = np.asarray(
-                    handle["record_hash"][:], dtype=np.uint64
-                )
-                episode_return = np.asarray(
-                    handle["episode_return"][:], dtype=np.float32
-                )
-                individual_return = np.asarray(handle["individual_return"][:], dtype=np.float32)
-            size = task_index.shape[0]
-            if not np.isfinite(episode_return).all() or not np.isfinite(individual_return).all():
-                raise RetrievalError(f"Non-finite utility metadata for anchor={anchor}")
-            if not (
-                row.shape[0] == size
-                and agent_id.shape[0] == size
-                and record_hash.shape[0] == size
-                and episode_return.shape[0] == size
-                and individual_return.shape[0] == size
-                and index.ntotal == size
-            ):
-                raise RetrievalError(
-                    f"Index/metadata size mismatch for anchor={anchor}"
-                )
-            if size:
-                self.buckets[anchor] = RetrievalBucket(
-                    anchor=anchor,
-                    index=index,
-                    task_index=task_index,
-                    row=row,
-                    agent_id=agent_id,
-                    record_hash=record_hash,
-                    episode_return=episode_return,
-                    individual_return=individual_return,
-                )
-        if not self.buckets:
-            raise RetrievalError("Retrieval manifest contains no non-empty buckets")
-        self._anchors = np.asarray(sorted(self.buckets), dtype=np.int64)
-        self._query_task_index: Optional[int] = None
-        self._query_rows: Optional[np.ndarray] = None
-        self._query_record_hashes: Optional[np.ndarray] = None
-        self._query_agent_cursor = 0
-        self._online_indexes = {
-            int(anchor): faiss.IndexFlatIP(self.embedding_dim)
-            for anchor in self._anchors
-        }
-        self._online_contexts: Dict[int, list] = {
-            int(anchor): [] for anchor in self._anchors
-        }
-        self._online_returns = {int(anchor): [] for anchor in self._anchors}
-        self._combined_utility_bounds = {key: list(value) for key, value in self.utility_bounds.items()}
+        self.source = TabxEpisodeSource(data_manifest, split="train", normalizer=normalizer,
+                                       seed=seed, h5_lru_size=h5_lru_size)
+        self._bucket_specs = {int(item["anchor"]): item for item in payload["buckets"]}
+        if set(self._bucket_specs) != set(range(self.context_length)):
+            raise RetrievalError("Index must cover every prefix length; rebuild all buckets")
+        if any(int(item["vectors"]) < self.k for item in self._bucket_specs.values()):
+            raise RetrievalError("Every prefix must have at least k offline candidates")
+        self.buckets = OrderedDict()
+        self._row_return_specs = payload["row_returns"]
+        self._row_returns = {}
+        self._query_record_hashes = None
+        self._query_episode_returns = None
+        self.reset_online_memory(seed)
 
-    def close(self) -> None:
+    def close(self):
+        self.buckets.clear()
+        self._row_returns.clear()
         self.source.close()
 
-    def begin_query_batch(
-        self, task_id: str, rows: Sequence[int]
-    ) -> None:
+    def _bucket(self, timestep):
+        anchor = int(timestep)
+        if not 0 <= anchor < self.context_length:
+            raise RetrievalError(f"Query prefix {anchor + 1} exceeds history length {self.context_length}")
+        if anchor in self.buckets:
+            self.buckets.move_to_end(anchor)
+            return self.buckets[anchor]
+        # Evict BEFORE loading, so peak resident indexes also obey the limit.
+        while len(self.buckets) >= self.index_cache_size:
+            self.buckets.popitem(last=False)
+        item = self._bucket_specs[anchor]
+        base = self.index_manifest_path.parent
+        flags = 0 if self.index_load_mode == "ram" else (
+            int(getattr(self.faiss, "IO_FLAG_MMAP", 0)) | int(getattr(self.faiss, "IO_FLAG_READ_ONLY", 0)))
+        started = time.perf_counter()
+        index = self.faiss.read_index(str(base / item["index_file"]), flags)
+        with self.h5py.File(str(base / item["metadata_file"]), "r") as handle:
+            columns = {name: np.asarray(handle[name][:]) for name in (
+                "task_index", "row", "agent_id", "record_hash", "episode_return", "individual_return")}
+        if index.d != self.embedding_dim or index.ntotal != int(item["vectors"]):
+            raise RetrievalError(f"Invalid index dimensions for prefix {anchor + 1}")
+        if any(value.shape != (index.ntotal,) for value in columns.values()):
+            raise RetrievalError(f"Index/metadata mismatch for prefix {anchor + 1}")
+        if not np.isfinite(columns["episode_return"]).all():
+            raise RetrievalError("Non-finite episode returns")
+        for task_index in np.unique(columns["task_index"]):
+            if not 0 <= task_index < len(self.tasks):
+                raise RetrievalError("Index contains an unknown task")
+            task = self.tasks[int(task_index)]
+            if task.split != "train":
+                raise RetrievalError("Offline retrieval may only contain training tasks")
+            selected = columns["task_index"] == task_index
+            rows, agents = columns["row"][selected], columns["agent_id"][selected]
+            if np.any((rows < 0) | (rows >= task.n_trajectories)) or np.any(
+                (agents < 0) | (agents >= task.n_agents)
+            ):
+                raise RetrievalError("Index contains an invalid trajectory or agent ID")
+        bucket = RetrievalBucket(anchor=anchor, index=index, **columns)
+        self.buckets[anchor] = bucket
+        if self.trace_search:
+            print(f"[retrieval-load] prefix={anchor + 1} vectors={index.ntotal} seconds={time.perf_counter()-started:.3f}", flush=True)
+        return bucket
+
+    def begin_query_batch(self, task_id: str, rows: Sequence[int]):
         task = self.source.manifest.task(task_id)
-        self._query_task_index = task.index
-        self._query_rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if task.split != "train":
+            raise RetrievalError("Training queries must belong to the training split")
+        if task_id not in self._row_returns:
+            from .provenance import file_sha256
+            spec = self._row_return_specs[task_id]
+            path = self.index_manifest_path.parent / spec["file"]
+            if file_sha256(path) != spec["sha256"]:
+                raise RetrievalError("Query episode-return metadata hash mismatch")
+            values = np.load(path, mmap_mode="r", allow_pickle=False)
+            if values.shape != (task.n_trajectories,) or not np.isfinite(values).all():
+                raise RetrievalError("Invalid full-episode query returns")
+            self._row_returns[task_id] = values
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.ndim != 1 or not rows.size or np.any((rows < 0) | (rows >= task.n_trajectories)):
+            raise RetrievalError("Invalid training query rows")
         self._query_record_hashes = self.source.record_hashes(task, rows)
-        self._query_agent_cursor = 0
+        self._query_episode_returns = np.asarray(self._row_returns[task_id][rows], dtype=np.float32)
 
-    def _nearest_bucket(self, timestep: int) -> RetrievalBucket:
-        anchor_index = int(np.argmin(np.abs(self._anchors - int(timestep))))
-        return self.buckets[int(self._anchors[anchor_index])]
-
-    def reset_online_memory(self, seed: Optional[int] = None) -> None:
-        self.completed_online_episodes = 0
+    def reset_online_memory(self, seed=None):
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
-        self._online_indexes = {
-            int(anchor): self.faiss.IndexFlatIP(self.embedding_dim)
-            for anchor in self._anchors
-        }
-        self._online_contexts = {int(anchor): [] for anchor in self._anchors}
-        self._online_returns = {int(anchor): [] for anchor in self._anchors}
-        self._combined_utility_bounds = {key: list(value) for key, value in self.utility_bounds.items()}
+        self.completed_online_episodes = 0
+        self._online_indexes = {}
+        self._online_contexts = {}
+        self._online_returns = {}
+        self._query_record_hashes = None
+        self._query_episode_returns = None
 
     @property
-    def offline_probability(self) -> float:
-        # Original MAICC meaning: epsilon is the probability of offline memory.
+    def offline_probability(self):
+        if self.completed_online_episodes < self.k:
+            return 1.0
         progress = self.completed_online_episodes / self.test_nepisode
         return max(0.01, min(1.0, math.exp(math.log(0.01) * progress)))
 
-    def _online_mips(self, querys, t: int):
-        import torch as th
-
-        anchor = self._nearest_bucket(t).anchor
-        index = self._online_indexes[anchor]
-        if index.ntotal < self.k:
+    def _online_mips(self, query, t, agent_id):
+        key = (int(t), int(agent_id))
+        index = self._online_indexes.get(key)
+        if self.completed_online_episodes < self.k or index is None:
             return None
-        queries = np.ascontiguousarray(querys, dtype=np.float32)
-        self.faiss.normalize_L2(queries)
-        distance, ids = index.search(queries, min(self.search_k, index.ntotal))
-        contexts = self._online_contexts[anchor]
-        selected = []
-        for query_id, row in enumerate(ids):
-            valid = [int(value) for value in row if int(value) >= 0]
-            if self.use_utility:
-                returns = np.asarray([self._online_returns[anchor][i] for i in valid])
-                bounds = self._utility_bounds_with_online()
-                scores = hybrid_scores(distance[query_id, :len(valid)], returns[:, 0],
-                                       returns[:, 1], self.utility_alpha, bounds)
-                valid = [valid[i] for i in np.argsort(-scores, kind="stable")]
-            while len(valid) < self.k:
-                valid.append(valid[len(valid) % len(valid)])
-            selected.extend(contexts[value] for value in valid[: self.k])
-        columns = list(zip(*selected))
-        dtypes = (
-            th.float32, th.float32, th.long, th.float32,
-            th.float32, th.float32, th.float32,
-        )
-        return tuple(
-            th.stack([th.as_tensor(value, dtype=dtype) for value in column]).to(
-                self.device
-            )
-            for column, dtype in zip(columns, dtypes)
-        )
+        metadata = self._online_returns[key]
+        if len({item[3] for item in metadata}) < self.k:
+            return None
+        # Each source episode contributes its most similar window. Original
+        # online retrieval chose k different episodes of this SAME agent.
+        count = min(index.ntotal, self.search_k)
+        while True:
+            distance, ids = index.search(query, count)
+            candidates, seen = [], set()
+            for similarity, candidate in zip(distance[0], ids[0]):
+                if candidate < 0:
+                    continue
+                candidate = int(candidate)
+                episode_id = metadata[candidate][3]
+                if episode_id not in seen:
+                    seen.add(episode_id)
+                    candidates.append((candidate, float(similarity)))
+                if len(candidates) >= self.search_k:
+                    break
+            if len(candidates) >= self.search_k or count == index.ntotal:
+                break
+            count = min(index.ntotal, count * 2)
+        if len(candidates) < self.k:
+            return None
+        scores = []
+        for candidate, similarity in candidates:
+            team, individual, n_present, _episode = metadata[candidate]
+            scores.append(online_scores(similarity, team, individual, n_present,
+                self.return_bounds, self.weight if self.use_utility else 0.0,
+                self.ind_weight if self.use_utility else 0.0))
+        order = np.argsort(-np.asarray(scores), kind="stable")[:self.k]
+        return [self._online_contexts[key][candidates[i][0]] for i in order]
 
-    def add_completed_online_episode(
-        self,
-        agent,
-        normalized_obs: np.ndarray,
-        actions: np.ndarray,
-        rewards: np.ndarray,
-        terminated: np.ndarray,
-        completion: np.ndarray,
-        present: np.ndarray,
-        normalized_rtg: np.ndarray,
-    ) -> None:
-        """Encode one terminal episode without gradients and add its windows."""
+    def add_completed_online_episode(self, agent, normalized_obs, actions, rewards,
+                                     terminated, completion, present, normalized_rtg):
         import torch as th
-
         if not self.enable_online_memory:
             return
         obs = np.asarray(normalized_obs, dtype=np.float32)
@@ -308,303 +266,145 @@ class TabxRetrievalStore:
         term = np.asarray(terminated, dtype=np.float32).reshape(-1, 1)
         comp = np.asarray(completion, dtype=np.float32).reshape(-1, 1)
         rtg = np.asarray(normalized_rtg, dtype=np.float32).reshape(-1, 1)
-        agent_present = np.asarray(present, dtype=bool).reshape(-1)
-        if obs.ndim != 3 or act.shape != obs.shape[:2]:
-            raise RetrievalError("Invalid completed online episode shapes")
+        present = np.asarray(present, dtype=bool).reshape(-1)
+        if obs.ndim != 3 or act.shape != obs.shape[:2] or present.size != obs.shape[1]:
+            raise RetrievalError("Invalid completed episode shapes")
         length, n_agents = obs.shape[:2]
-        if not (
-            rew.shape[0] == term.shape[0] == comp.shape[0] == rtg.shape[0] == length
-        ):
-            raise RetrievalError("Online episode fields have different lengths")
-        context_length = self.source.manifest.sequence_length
-        starts = list(range(0, max(1, length - context_length + 1), context_length))
-        tail_start = max(0, length - context_length)
-        if tail_start not in starts:
-            starts.append(tail_start)
-
+        if length < 1 or any(len(x) != length for x in (rew, term, comp, rtg)):
+            raise RetrievalError("Invalid completed episode length")
+        context_length = self.context_length
+        starts = set(range(0, max(1, length-context_length+1), context_length))
+        starts.add(max(0, length-context_length))
         device = next(agent.parameters()).device
-        pending = []
+        pending, covered_until = [], 0
         individual_return = np.zeros(n_agents, dtype=np.float64)
-        covered_until = 0
         with th.no_grad():
-            for start in sorted(set(starts)):
+            for start in sorted(starts):
                 end = min(length, start + context_length)
                 valid_length = end - start
-                pad_obs = np.zeros(
-                    (1, context_length, n_agents, obs.shape[-1]), np.float32
-                )
-                pad_action = np.zeros((1, context_length, n_agents), np.int64)
+                pad_obs = np.zeros((1, context_length, n_agents, obs.shape[-1]), np.float32)
+                pad_action = np.full((1, context_length, n_agents), 7, np.int64)
                 pad_post = np.zeros((1, context_length, 3), np.float32)
-                pad_reward = np.zeros((context_length, 1), np.float32)
                 pad_rtg = np.zeros((1, context_length, 1), np.float32)
-                pad_mask = np.zeros((1, context_length, 1), np.float32)
+                pad_mask = np.zeros((context_length, 1), np.float32)
                 pad_obs[0, :valid_length] = obs[start:end]
                 pad_action[0, :valid_length] = act[start:end]
-                pad_post[0, :valid_length] = np.concatenate(
-                    [rew[start:end], term[start:end], comp[start:end]], axis=-1
-                )
-                pad_reward[:valid_length] = rew[start:end]
+                pad_post[0, :valid_length] = np.concatenate([rew[start:end], term[start:end], comp[start:end]], -1)
                 pad_rtg[0, :valid_length] = rtg[start:end]
-                pad_mask[0, :valid_length] = 1
-                tensors = [
-                    th.as_tensor(value, device=device)
-                    for value in (pad_rtg, pad_obs, pad_action, pad_post)
-                ]
+                pad_mask[:valid_length] = 1
+                tensors = [th.as_tensor(x, device=device) for x in (pad_rtg, pad_obs, pad_action, pad_post)]
                 embeddings, predicted = encode_dem_prefixes(agent, *tensors, return_rewards=True)
                 embeddings = embeddings.cpu().numpy()
                 first = max(covered_until, start) - start
                 individual_return += predicted[0, first:valid_length].cpu().numpy().sum(0)
                 covered_until = max(covered_until, end)
-                candidate_anchors = [self._nearest_bucket(valid_length - 1).anchor]
-                if start == 0:
-                    candidate_anchors.extend(
-                        int(anchor) for anchor in self._anchors
-                        if int(anchor) < valid_length
-                    )
-                for anchor in sorted(set(candidate_anchors)):
-                    position = min(anchor, valid_length - 1)
-                    vectors = []
-                    payloads = []
-                    for agent_id in range(n_agents):
-                        if not agent_present[agent_id]:
-                            continue
-                        vectors.append(embeddings[0, position, agent_id])
-                        payloads.append(
-                            (
-                                th.as_tensor(pad_obs[0, :, agent_id]),
-                                th.as_tensor(pad_reward),
-                                th.as_tensor(pad_action[0, :, agent_id, None]),
-                                th.as_tensor(pad_post[0, :, 1:2]),
-                                th.as_tensor(pad_mask[0]),
-                                th.as_tensor(pad_rtg[0]),
-                                th.as_tensor(pad_post[0, :, 2:3]),
-                            )
-                        )
-                    if vectors:
-                        matrix = np.ascontiguousarray(vectors, dtype=np.float32)
-                        if not np.isfinite(matrix).all():
-                            raise RetrievalError("Non-finite online embedding")
-                        self.faiss.normalize_L2(matrix)
-                        pending.append((anchor, matrix, payloads, np.flatnonzero(agent_present)))
+                for agent_id in np.flatnonzero(present):
+                    context = (pad_obs[0, :, agent_id], pad_post[0, :, :1],
+                               pad_action[0, :, agent_id, None], pad_post[0, :, 1:2],
+                               pad_mask, pad_rtg[0], pad_post[0, :, 2:3])
+                    # Store one shared payload per window/agent, not a copy per prefix.
+                    payload = tuple(th.as_tensor(x.copy()) for x in context)
+                    for anchor in range(valid_length):
+                        vector = np.ascontiguousarray(embeddings[0, anchor, agent_id:agent_id+1])
+                        if not np.isfinite(vector).all():
+                            raise RetrievalError("Non-finite online key")
+                        self.faiss.normalize_L2(vector)
+                        pending.append(((anchor, int(agent_id)), vector, payload))
         team_return = float(rew.sum(dtype=np.float64))
         if not np.isfinite(team_return) or not np.isfinite(individual_return).all():
-            raise RetrievalError("Non-finite online episode utility")
-        for name, values in (("team", np.asarray([team_return])),
-                             ("individual", individual_return[agent_present])):
-            if values.size:
-                limits = self._combined_utility_bounds[name]
-                limits[0] = min(limits[0], float(values.min()))
-                limits[1] = max(limits[1], float(values.max()))
-        for anchor, matrix, payloads, agent_ids in pending:
-            self._online_indexes[anchor].add(matrix)
-            self._online_contexts[anchor].extend(payloads)
-            self._online_returns[anchor].extend(
-                (team_return, float(individual_return[i])) for i in agent_ids
-            )
+            raise RetrievalError("Non-finite online utility")
+        for key, vector, payload in pending:
+            if key not in self._online_indexes:
+                self._online_indexes[key] = self.faiss.IndexFlatIP(self.embedding_dim)
+                self._online_contexts[key], self._online_returns[key] = [], []
+            self._online_indexes[key].add(vector)
+            self._online_contexts[key].append(payload)
+            self._online_returns[key].append((team_return, float(individual_return[key[1]]),
+                                             int(present.sum()), self.completed_online_episodes))
         self.completed_online_episodes += 1
 
-    def _utility_bounds_with_online(self):
-        return self._combined_utility_bounds
-
-    def _select_candidates(
-        self,
-        bucket: RetrievalBucket,
-        query_embeddings: np.ndarray,
-        query_return: Optional[np.ndarray],
-        test_mode: bool = False,
-    ) -> List[List[int]]:
-        queries = np.ascontiguousarray(query_embeddings, dtype=np.float32)
-        if (
-            queries.ndim != 2
-            or queries.shape[0] <= 0
-            or queries.shape[1] != self.embedding_dim
-        ):
-            raise RetrievalError(
-                f"Query shape {queries.shape}, expected [B, {self.embedding_dim}]"
-            )
-        finite = np.isfinite(queries)
-        if not bool(finite.all()):
-            invalid = int(queries.size - np.count_nonzero(finite))
-            invalid_by_row = np.count_nonzero(~finite, axis=1)
-            invalid_rows = np.flatnonzero(invalid_by_row).tolist()
-            raise RetrievalError(
-                "Non-finite retrieval query before FAISS normalization: "
-                f"shape={queries.shape}, invalid_values={invalid}, "
-                f"total_values={queries.size}, invalid_rows={invalid_rows}, "
-                f"invalid_counts={invalid_by_row[invalid_by_row > 0].tolist()}"
-            )
-        raw_norms = np.linalg.norm(queries, axis=1)
-        call_id = self._offline_search_calls
-        self._offline_search_calls += 1
-        if self.trace_search:
-            print(
-                "[retrieval-query] "
-                f"call={call_id} anchor={bucket.anchor} shape={queries.shape} "
-                f"norm_min={float(raw_norms.min()):.6g} "
-                f"norm_max={float(raw_norms.max()):.6g}",
-                flush=True,
-            )
-        self.faiss.normalize_L2(queries)
-        # Offline training queries must search deeply enough to remove every
-        # window from the same source record. Online queries have no source
-        # record to exclude, so starting at 128 candidates only makes HNSW
-        # substantially more expensive; diversity filtering can expand the
-        # candidate set adaptively when necessary.
-        if self._query_record_hashes is None:
-            initial_candidates = (max(self.online_search_k, self.search_k)
-                                  if test_mode and self.use_utility else self.online_search_k)
-        else:
-            initial_candidates = max(self.search_k, 128)
-        candidate_count = min(bucket.index.ntotal, initial_candidates)
-        max_candidates = min(bucket.index.ntotal, 4096)
+    def _select_candidates(self, bucket, queries, query_return, test_mode=False,
+                           query_record_hashes=None):
+        count = min(bucket.index.ntotal, max(self.search_k, self.k))
         while True:
-            if self.trace_search:
-                print(
-                    "[retrieval-search-start] "
-                    f"call={call_id} anchor={bucket.anchor} "
-                    f"queries={queries.shape[0]} candidates={candidate_count}",
-                    flush=True,
-                )
-            search_started = time.perf_counter()
-            distance, indices = bucket.index.search(queries, candidate_count)
-            if test_mode and self.use_utility:
-                bounds = self._utility_bounds_with_online()
-                for q, ids in enumerate(indices):
-                    valid_count = int(np.count_nonzero(ids >= 0))
-                    valid_ids = ids[:valid_count].copy()
-                    scores = hybrid_scores(distance[q, :valid_count],
-                        bucket.episode_return[valid_ids], bucket.individual_return[valid_ids],
-                        self.utility_alpha, bounds)
-                    indices[q, :valid_count] = valid_ids[np.argsort(-scores, kind="stable")]
-            search_elapsed = time.perf_counter() - search_started
-            selected: List[List[int]] = []
-            for query_index, candidates in enumerate(indices):
-                pool: List[int] = []
-                for candidate in candidates:
-                    candidate_id = int(candidate)
-                    if candidate_id < 0:
-                        continue
-                    if (
-                        self._query_record_hashes is not None
-                        and query_index < self._query_record_hashes.size
-                        and bucket.record_hash[candidate_id]
-                        == self._query_record_hashes[query_index]
-                    ):
-                        # Exclude every overlapping window from the same source
-                        # record, not only the exact HDF5 row.
-                        continue
-                    pool.append(candidate_id)
-
-                # Prefer k different source records; relax diversity only if
-                # the adaptive search ceiling still cannot provide enough.
-                accepted: List[int] = []
-                accepted_records = set()
-                for candidate_id in pool:
-                    source_id = int(bucket.record_hash[candidate_id])
-                    if source_id in accepted_records:
-                        continue
-                    accepted.append(candidate_id)
-                    accepted_records.add(source_id)
-                    if len(accepted) == self.k:
-                        break
-                if len(accepted) < self.k and candidate_count >= max_candidates:
-                    for candidate_id in pool:
-                        if candidate_id not in accepted:
-                            accepted.append(candidate_id)
-                        if len(accepted) == self.k:
-                            break
-                selected.append(accepted)
-            if self.trace_search or search_elapsed >= 1.0:
-                diversity = [len(items) for items in selected]
-                print(
-                    "[retrieval-search-done] "
-                    f"call={call_id} anchor={bucket.anchor} "
-                    f"candidates={candidate_count} seconds={search_elapsed:.6f} "
-                    f"accepted_min={min(diversity, default=0)} "
-                    f"accepted_max={max(diversity, default=0)}",
-                    flush=True,
-                )
-            if all(len(items) >= self.k for items in selected):
+            distance, indices = bucket.index.search(queries, count)
+            pools = []
+            for q, row in enumerate(indices):
+                candidates = [(int(i), float(d)) for i, d in zip(row, distance[q]) if i >= 0
+                    and (query_record_hashes is None or bucket.record_hash[int(i)] != query_record_hashes[q])]
+                pools.append(candidates[:self.search_k])
+            if all(len(pool) >= self.search_k for pool in pools) or count == bucket.index.ntotal:
                 break
-            if candidate_count >= max_candidates:
-                break
-            candidate_count = min(max_candidates, candidate_count * 2)
-
-        for query_index, accepted in enumerate(selected):
-            if not accepted:
-                raise RetrievalError(
-                    "No retrieval candidate remains after source-record exclusion"
-                )
-            while len(accepted) < self.k:
-                accepted.append(accepted[len(accepted) % len(accepted)])
+            count = min(bucket.index.ntotal, count * 2)
+        selected = []
+        for q, pool in enumerate(pools):
+            if len(pool) < self.k:
+                raise RetrievalError("Fewer than k candidates remain after source-episode exclusion")
+            ids = np.asarray([item[0] for item in pool], dtype=np.int64)
+            similarity = np.asarray([item[1] for item in pool])
+            if test_mode:
+                scores = offline_scores(similarity, bucket.episode_return[ids], self.return_bounds,
+                                        self.weight if self.use_utility else 0.0)
+            else:
+                if query_return is None:
+                    raise RetrievalError("Training retrieval requires complete source-episode returns")
+                scores = training_scores(similarity, bucket.episode_return[ids],
+                                         query_return[q], self.max_similarity)
+            chosen = ids[np.argsort(-scores, kind="stable")[:self.k]]
+            if not test_mode:
+                chosen = self.rng.permutation(chosen)
+            selected.append(chosen.tolist())
         return selected
 
-    def mips(
-        self,
-        querys,
-        t: int,
-        query_return=None,
-        test_mode: bool = False,
-    ):
+    def mips(self, querys, t, query_return=None, test_mode=False,
+             agent_ids=None, query_indices=None):
         import torch as th
-
+        queries = np.array(querys, dtype=np.float32, order="C", copy=True)
+        if queries.ndim != 2 or queries.shape[1] != self.embedding_dim or not np.isfinite(queries).all():
+            raise RetrievalError("Invalid retrieval query")
+        if not 0 <= int(t) < self.context_length:
+            raise RetrievalError("Pass the actual bounded query prefix length, not episode time")
+        self.faiss.normalize_L2(queries)
+        size = len(queries)
+        if size == 0:
+            raise RetrievalError("Empty retrieval query")
+        if test_mode:
+            if agent_ids is None or len(agent_ids) != size:
+                raise RetrievalError("Online retrieval requires an explicit local agent ID per query")
+            hashes = returns = None
+        else:
+            if self._query_episode_returns is None:
+                raise RetrievalError("Call begin_query_batch before training retrieval")
+            positions = np.arange(len(self._query_episode_returns)) if query_indices is None else np.asarray(query_indices, dtype=np.int64)
+            if positions.shape != (size,) or np.any(
+                (positions < 0) | (positions >= len(self._query_episode_returns))
+            ):
+                raise RetrievalError("Training query rows do not match the sampled batch")
+            hashes = self._query_record_hashes[positions]
+            returns = self._query_episode_returns[positions]
+            if query_return is not None:
+                supplied = query_return.detach().cpu().numpy() if hasattr(query_return, "detach") else query_return
+                if not np.allclose(np.asarray(supplied).reshape(-1), returns):
+                    raise RetrievalError("query_return must equal complete episode return, not window return")
+        contexts = [None] * size
         if test_mode and self.enable_online_memory:
-            online = self._online_mips(querys, t)
-            if online is not None and self.rng.random() >= self.offline_probability:
-                return online
-        bucket = self._nearest_bucket(t)
-        returns = (
-            None
-            if query_return is None
-            else np.asarray(query_return.detach().cpu(), dtype=np.float32).reshape(-1)
-        )
-        selected = self._select_candidates(
-            bucket,
-            np.asarray(querys, dtype=np.float32),
-            returns,
-            test_mode=test_mode,
-        )
-        observations: List[th.Tensor] = []
-        rewards: List[th.Tensor] = []
-        actions: List[th.Tensor] = []
-        terminated: List[th.Tensor] = []
-        masks: List[th.Tensor] = []
-        rtgs: List[th.Tensor] = []
-        completions: List[th.Tensor] = []
-        for candidates in selected:
-            for candidate_id in candidates:
-                task_index = int(bucket.task_index[candidate_id])
-                if not 0 <= task_index < len(self.tasks):
-                    raise RetrievalError(
-                        f"Invalid task_index={task_index} in retrieval metadata"
-                    )
-                task = self.tasks[task_index]
-                context = self.source.load_agent_context(
-                    task=task,
-                    row=int(bucket.row[candidate_id]),
-                    agent_id=int(bucket.agent_id[candidate_id]),
-                )
-                obs, reward, action, term, filled, rtg, completion = context
-                observations.append(th.as_tensor(obs, dtype=th.float32))
-                rewards.append(th.as_tensor(reward, dtype=th.float32))
-                actions.append(th.as_tensor(action, dtype=th.long))
-                terminated.append(th.as_tensor(term, dtype=th.float32))
-                masks.append(th.as_tensor(filled, dtype=th.float32))
-                rtgs.append(th.as_tensor(rtg, dtype=th.float32))
-                completions.append(
-                    th.as_tensor(completion, dtype=th.float32)
-                )
-        self._query_agent_cursor += 1
-        return (
-            th.stack(observations).to(self.device),
-            th.stack(rewards).to(self.device),
-            th.stack(actions).to(self.device),
-            th.stack(terminated).to(self.device),
-            th.stack(masks).to(self.device),
-            th.stack(rtgs).to(self.device),
-            th.stack(completions).to(self.device),
-        )
-
+            for q, agent_id in enumerate(agent_ids):
+                if self.rng.random() >= self.offline_probability:
+                    contexts[q] = self._online_mips(queries[q:q+1], t, int(agent_id))
+        offline_rows = [q for q, item in enumerate(contexts) if item is None]
+        if offline_rows:
+            bucket = self._bucket(t)
+            chosen = self._select_candidates(bucket, queries[offline_rows],
+                None if returns is None else returns[offline_rows], test_mode,
+                None if hashes is None else hashes[offline_rows])
+            for q, candidates in zip(offline_rows, chosen):
+                contexts[q] = [self.source.load_agent_context(
+                    self.tasks[int(bucket.task_index[i])], int(bucket.row[i]), int(bucket.agent_id[i]))
+                    for i in candidates]
+        flat = [context for row in contexts for context in row]
+        dtypes = (th.float32, th.float32, th.long, th.float32, th.float32, th.float32, th.float32)
+        return tuple(th.stack([th.as_tensor(value, dtype=dtype) for value in column]).to(self.device)
+                     for column, dtype in zip(zip(*flat), dtypes))
 
 def encode_dem_prefixes(
     agent,

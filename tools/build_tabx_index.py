@@ -143,21 +143,26 @@ def main() -> int:
     manifest_path = output_dir / "retrieval_manifest.json"
     if manifest_path.exists() and not cli.overwrite:
         raise SystemExit(f"Output exists: {manifest_path}; use --overwrite")
+    if manifest_path.exists():
+        # Interrupted overwrites must not leave a ready manifest referring to
+        # a mixture of old and newly written buckets.
+        manifest_path.unlink()
 
-    history_buckets = retrieval.get("history_buckets", [1, 4, 8, 16, 32])
-    anchors = sorted(
-        {
-            min(manifest.sequence_length, max(1, int(length))) - 1
-            for length in history_buckets
-        }
-    )
-    index_factory = str(retrieval.get("index_factory", "HNSW32,Flat"))
-    indexes = {
-        anchor: faiss.index_factory(
-            mac.agent.n_embd, index_factory, faiss.METRIC_INNER_PRODUCT
-        )
-        for anchor in anchors
-    }
+    # Index every prefix, including intermediate windows. Query and candidate
+    # encodings then have exactly the same number of historical timesteps.
+    anchors = list(range(manifest.sequence_length))
+    configured_buckets = retrieval.get("history_buckets")
+    if configured_buckets is not None and configured_buckets != list(range(1, manifest.sequence_length + 1)):
+        raise SystemExit("Remove legacy sparse history_buckets; v4 indexes every exact prefix")
+    index_factory = str(retrieval.get("index_factory", "Flat"))
+    if index_factory != "Flat" and not retrieval.get("allow_approximate_index", False):
+        raise SystemExit("Approximate indexes require allow_approximate_index=true")
+    if index_factory not in {"Flat", "HNSW32,Flat"}:
+        raise SystemExit("Supported index_factory: Flat or explicit HNSW32,Flat ablation")
+    vector_paths = {anchor: output_dir / f".bucket_{anchor:04d}.vectors.f32" for anchor in anchors}
+    vector_streams = {}
+    vector_counts = {anchor: 0 for anchor in anchors}
+    row_return_specs = {}
     metadata_handles = {}
     for anchor in anchors:
         metadata_path = output_dir / f"bucket_{anchor:04d}.h5"
@@ -166,8 +171,11 @@ def main() -> int:
                 raise SystemExit(f"Output exists: {metadata_path}")
             metadata_path.unlink()
         metadata_handles[anchor] = create_metadata_file(metadata_path)
+        vector_streams[anchor] = vector_paths[anchor].open("wb")
 
     rows_per_batch = int(retrieval.get("index_batch_rows", 8))
+    if rows_per_batch < 1:
+        raise SystemExit("index_batch_rows must be positive")
     max_rows_per_task = int(retrieval.get("max_index_rows_per_task", 0))
     source = TabxEpisodeSource(
         manifest=manifest,
@@ -178,13 +186,15 @@ def main() -> int:
     )
     try:
         causal_check_done = False
-        utility_bounds = {"team": [float("inf"), -float("inf")],
-                          "individual": [float("inf"), -float("inf")]}
+        utility_bounds = {"team": [_args.min_return, _args.max_return]}
         with th.no_grad():
             for task in source.tasks:
-                print(f"[utility] encoding complete episodes for {task.task_id}", flush=True)
+                print(f"[utility] accumulating complete episode returns for {task.task_id}", flush=True)
                 team_returns, individual_returns = compute_episode_utilities(
-                    source, task, mac.agent, device, rows_per_batch)
+                    source, task, mac.agent, device, rows_per_batch, predict_individual=False)
+                return_path = output_dir / f"task_{task.index:06d}_episode_returns.npy"
+                np.save(return_path, team_returns, allow_pickle=False)
+                row_return_specs[task.task_id] = {"file": return_path.name, "sha256": file_sha256(return_path)}
                 if (
                     max_rows_per_task > 0
                     and task.n_trajectories > max_rows_per_task
@@ -219,21 +229,14 @@ def main() -> int:
                     embedding = encode_dem_prefixes(
                         mac.agent, rtg, obs, action, post
                     )
-                    final_returns = returns[:, -1, 0].detach().cpu().numpy()
                     present = batch["present"][:, :-1, :, 0].cpu().numpy() != 0
                     valid = (
                         mask[:, :, 0].detach().cpu().numpy()[:, :, None] != 0
                     ) & present
                     record_hashes = source.record_hashes(task, rows)
-                    segment_start_rows = source.segment_start_rows(task, rows)
                     embedding_np = embedding.detach().cpu().numpy()
                     for anchor in anchors:
                         anchor_valid = valid[:, anchor, :].copy()
-                        if anchor != anchors[-1]:
-                            # Short-history buckets model the beginning of an
-                            # episode; do not multiply every rolling window by
-                            # all five history buckets.
-                            anchor_valid &= segment_start_rows[:, None]
                         row_ids, agent_ids = np.nonzero(anchor_valid)
                         if row_ids.size == 0:
                             continue
@@ -242,7 +245,8 @@ def main() -> int:
                             dtype=np.float32,
                         )
                         faiss.normalize_L2(vectors)
-                        indexes[anchor].add(vectors)
+                        vectors.tofile(vector_streams[anchor])
+                        vector_counts[anchor] += len(vectors)
                         append_metadata(
                             metadata_handles[anchor],
                             {
@@ -256,12 +260,6 @@ def main() -> int:
                                 "individual_return": individual_returns[rows[row_ids], agent_ids],
                             },
                         )
-                        for name, values in (
-                            ("team", team_returns[rows[row_ids]]),
-                            ("individual", individual_returns[rows[row_ids], agent_ids]),
-                        ):
-                            utility_bounds[name][0] = min(utility_bounds[name][0], float(values.min()))
-                            utility_bounds[name][1] = max(utility_bounds[name][1], float(values.max()))
                 print(
                     f"[index] task={task.task_id} "
                     f"rows={selected_rows.size}/{task.n_trajectories}",
@@ -271,21 +269,37 @@ def main() -> int:
         source.close()
         for handle in metadata_handles.values():
             handle.close()
+        for stream in vector_streams.values():
+            stream.close()
 
     buckets = []
     for anchor in anchors:
         index_path = output_dir / f"bucket_{anchor:04d}.faiss"
-        faiss.write_index(indexes[anchor], str(index_path))
+        count = vector_counts[anchor]
+        if count < _args.k:
+            raise SystemExit(f"Prefix {anchor+1} has only {count} candidates; need at least k={_args.k}")
+        # Build one index at a time; never retain L full indexes in memory.
+        index = faiss.index_factory(mac.agent.n_embd, index_factory, faiss.METRIC_INNER_PRODUCT)
+        vectors = np.memmap(vector_paths[anchor], dtype=np.float32, mode="r",
+                            shape=(count, mac.agent.n_embd))
+        for offset in range(0, count, 65536):
+            index.add(np.ascontiguousarray(vectors[offset:offset+65536]))
+        faiss.write_index(index, str(index_path))
+        del vectors, index
+        vector_paths[anchor].unlink()
+        print(f"[index-write] prefix={anchor+1}/{manifest.sequence_length} vectors={count}", flush=True)
         buckets.append(
             {
                 "anchor": anchor,
-                "vectors": int(indexes[anchor].ntotal),
+                "vectors": vector_counts[anchor],
                 "index_file": index_path.name,
                 "metadata_file": f"bucket_{anchor:04d}.h5",
             }
         )
     payload = {
-        "schema": "tabx_retrieval_index_v3",
+        "schema": "tabx_retrieval_index_v4",
+        "prefix_policy": "exact_all_windows",
+        "row_returns": row_return_specs,
         "data_manifest": str(manifest.path),
         "stage0_checkpoint": str(checkpoint),
         "embedding_dim": int(mac.agent.n_embd),
@@ -297,7 +311,7 @@ def main() -> int:
         "normalization_sha256": file_sha256(data["normalization"]),
         "source_identity": source_identity(),
         "utility_bounds": utility_bounds,
-        "utility_definition": "complete_episode_dem_sum_bounded_history",
+        "utility_definition": "offline_team_only_online_local_dem_sum_bounded_history",
         "buckets": buckets,
     }
     temp = output_dir / ".retrieval_manifest.json.tmp"

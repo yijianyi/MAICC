@@ -290,7 +290,7 @@ class TabxEpisodeSource:
         return obs, reward, action, terminated, filled, rtg, completion
 
     def record_hashes(self, task: TabxTask, rows: Sequence[int]) -> np.ndarray:
-        """Return stable uint64 source-record ids for leakage exclusion."""
+        """Return stable source-episode IDs, shared by all overlapping windows."""
         cached = self._record_hashes.get(task.task_id)
         if cached is None:
             if task.index_path is None or not task.index_path.is_file():
@@ -304,7 +304,10 @@ class TabxEpisodeSource:
                 for line in handle:
                     item = json.loads(line)
                     row = int(item["row"])
-                    token = str(item["source_record"]).encode("utf-8")
+                    token = json.dumps([str(item["source_record"]),
+                                        int(item["source_segment_start"]),
+                                        int(item["source_segment_end"])],
+                                       separators=(",", ":")).encode("utf-8")
                     cached[row] = int.from_bytes(
                         hashlib.blake2b(token, digest_size=8).digest(), "little"
                     )

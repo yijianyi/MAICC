@@ -3,11 +3,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export MAICC_DATA_DIR="${MAICC_DATA_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100}"
 export MAICC_SEED="${MAICC_SEED:-7}"
-export MAICC_RUN_DIR="${MAICC_RUN_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v1_seed${MAICC_SEED}}"
+export MAICC_RUN_DIR="${MAICC_RUN_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v2_seed${MAICC_SEED}}"
 BASELINE_PYTHON="${BASELINE_PYTHON:-python}"
 BASELINE_STAGE0=src/config/tabx/baseline_stage0.yaml
 BASELINE_STAGE1=src/config/tabx/baseline_stage1.yaml
 case "${1:-check}" in
+  verify)
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$BASELINE_PYTHON" -m pytest tests/tabx -q
+    ;;
   check)
     "$BASELINE_PYTHON" tools/check_tabx_baseline.py --config "$BASELINE_STAGE0"
     ;;
@@ -33,8 +36,8 @@ case "${1:-check}" in
     ;;
   eval)
     "$BASELINE_PYTHON" tools/eval_tabx_online.py --config "$BASELINE_STAGE1" \
-      --checkpoint "$MAICC_RUN_DIR/stage1/step_000100000" --episodes 100 \
+      --checkpoint "$MAICC_RUN_DIR/stage1/step_000500000" --episodes 100 \
       --output-dir "$MAICC_RUN_DIR/eval" "${@:2}"
     ;;
-  *) echo "Usage: bash $0 {check|smoke|stage0|index|stage1|all|eval} [extra arguments]" >&2; exit 2 ;;
+  *) echo "Usage: bash $0 {verify|check|smoke|stage0|index|stage1|all|eval} [extra arguments]" >&2; exit 2 ;;
 esac

@@ -35,6 +35,8 @@ METRIC_FIELDS = (
     "step",
     "task_id",
     "batch_size",
+    "micro_batch_size",
+    "accumulation_steps",
     "n_agents",
     "valid_timesteps",
     "valid_agent_steps",
@@ -173,6 +175,12 @@ def build_maicc_args(
     model = dict(config.get("model", {}))
     training = dict(config.get("training", {}))
     retrieval = dict(config.get("retrieval", {}))
+    if training.get("dt_loss_reduction", "sum") not in {"sum", "mean"}:
+        raise TabxTrainingError("dt_loss_reduction must be sum or mean")
+    if int(training.get("max_batch_size", 32)) < 1:
+        raise TabxTrainingError("max_batch_size must be positive")
+    if "utility_alpha" in retrieval or "online_search_k" in retrieval:
+        raise TabxTrainingError("Migrate legacy retrieval options to weight, ind_weight and search_k")
     max_agents = int(
         model.get("max_agents", manifest.max_agents)
     )
@@ -181,15 +189,16 @@ def build_maicc_args(
             f"model.max_agents={max_agents} is below manifest max_agents="
             f"{manifest.max_agents}"
         )
+    train_tasks = manifest.tasks_for_split("train")
     max_return_value = training.get("max_return", "auto")
     max_return = (
-        max(1.0, manifest.max_return)
+        max(1.0, max(task.return_max for task in train_tasks))
         if str(max_return_value).lower() == "auto"
         else float(max_return_value)
     )
     min_return_value = training.get("min_return", "auto")
     min_return = (
-        manifest.min_return
+        min(task.return_min for task in train_tasks)
         if str(min_return_value).lower() == "auto"
         else float(min_return_value)
     )
@@ -221,7 +230,7 @@ def build_maicc_args(
         n_agents=max_agents,
         n_actions=manifest.action_dim,
         k=int(retrieval.get("k", 2)),
-        l=int(retrieval.get("search_k", 32)),
+        l=int(retrieval.get("search_k", 50)),
         max_similarity=float(retrieval.get("max_similarity", 0.98)),
         action_selector="soft_policies",
         agent_output_type="pi_logits",
@@ -235,7 +244,10 @@ def build_maicc_args(
         n_zones=int(model.get("n_zones", 4)),
         max_enemies=layout.max_enemies,
         obs_other_blocks=layout.other_blocks,
-        obs_visible_weight=float(model.get("obs_visible_weight", 4.0)),
+        obs_visible_weight=float(model.get("obs_visible_weight", 1.0)),
+        cem_architecture=str(model.get("cem_architecture", "dense")),
+        gradient_checkpointing=bool(model.get("gradient_checkpointing", True)),
+        dt_loss_reduction=str(training.get("dt_loss_reduction", "sum")),
         # Kept for the original TransformerAgent internals: this flag controls
         # only CEM/DEM. DT retains its original RTG token unconditionally.
         use_rtg=encoder_use_rtg,
@@ -247,16 +259,16 @@ def build_maicc_args(
         use_amp=bool(training.get("use_amp", False)),
         amp_dtype=str(training.get("amp_dtype", "float16")),
         learner_log_interval=int(training.get("log_interval", 100)),
-        grad_norm_clip=float(training.get("grad_norm_clip", 10.0)),
+        grad_norm_clip=float(training.get("grad_norm_clip", 0.0)),
         max_return=max_return,
         min_return=min_return,
         online_target_rtg=float(
             np.median(
-                [task.target_return / task.return_scale for task in manifest.tasks]
+                [task.target_return / task.return_scale for task in train_tasks]
             )
         ),
         online_return_scale=float(
-            np.median([task.return_scale for task in manifest.tasks])
+            np.median([task.return_scale for task in train_tasks])
         ),
         batch_size=int(training.get("max_batch_size", 8)),
         device=device,
@@ -358,6 +370,33 @@ def load_checkpoint(checkpoint_dir: Path, learner, device: str) -> int:
     return int(state["step"])
 
 
+def train_sampled_update(source, learner, max_batch_size, agent_time_budget,
+                         device, step, train_mode, store=None):
+    """One optimizer update over the declared batch, using bounded microbatches."""
+    sampled = source.sample(max_batch_size=max_batch_size, agent_time_budget=0)
+    batch = sampled.batch
+    size = batch.batch_size
+    micro_size = source.batch_size_for_task(sampled.task, size, agent_time_budget)
+    metrics = {}
+    for start in range(0, size, micro_size):
+        end = min(size, start + micro_size)
+        micro = batch[start:end]
+        if device == "cuda":
+            micro.to(device)
+        if store is not None:
+            store.begin_query_batch(sampled.task.task_id, sampled.rows[start:end])
+        weight = (end - start) / size
+        values = learner.train(micro, t_env=step, episode_num=step, buffer=store,
+                               train_mode=train_mode, loss_weight=weight,
+                               finish_update=end == size)
+        for key, value in values.items():
+            metrics[key] = metrics.get(key, 0.0) + weight * value
+        del micro
+    metrics.update(micro_batch_size=micro_size,
+                   accumulation_steps=(size + micro_size - 1) // micro_size)
+    return sampled, metrics
+
+
 def run_stage0(
     config: Mapping[str, Any],
     manifest_path: Path,
@@ -435,20 +474,10 @@ def run_stage0(
     )
     try:
         for step in range(start_step + 1, total_steps + 1):
-            sampled = source.sample(
-                max_batch_size=max_batch_size,
-                agent_time_budget=agent_time_budget,
-            )
+            sampled, loss_metrics = train_sampled_update(
+                source, learner, max_batch_size, agent_time_budget, device,
+                step, train_mode=0, store=None)
             batch = sampled.batch
-            if device == "cuda":
-                batch.to(device)
-            loss_metrics = learner.train(
-                batch=batch,
-                t_env=step,
-                episode_num=step,
-                buffer=None,
-                train_mode=0,
-            )
             if step % metrics_interval == 0:
                 metric_writer.write(
                     {
@@ -550,14 +579,17 @@ def run_stage1(
         normalizer=normalizer,
         k=args.k,
         search_k=args.l,
-        online_search_k=int(retrieval.get("online_search_k", 16)),
         device=device,
         seed=seed,
         h5_lru_size=int(data.get("h5_lru_size", 16)),
         index_load_mode=str(retrieval.get("index_load_mode", "ram")),
         faiss_threads=int(retrieval.get("faiss_threads", 4)),
         trace_search=bool(retrieval.get("trace_search", False)),
-        utility_alpha=float(retrieval.get("utility_alpha", 0.8)),
+        weight=float(retrieval.get("weight", 0.8)),
+        ind_weight=float(retrieval.get("ind_weight", 0.2)),
+        max_similarity=args.max_similarity,
+        index_cache_size=int(retrieval.get("index_cache_size", 2)),
+        allow_approximate_index=bool(retrieval.get("allow_approximate_index", False)),
         use_utility=bool(retrieval.get("use_utility", True)),
         expected_encoder_sha256=encoder_sha256(mac.agent.state_dict()),
         normalization_path=normalization_path,
@@ -576,21 +608,10 @@ def run_stage1(
     last_checkpoint = output_dir
     try:
         for step in range(start_step + 1, total_steps + 1):
-            sampled = source.sample(
-                max_batch_size=max_batch_size,
-                agent_time_budget=agent_time_budget,
-            )
-            store.begin_query_batch(sampled.task.task_id, sampled.rows)
+            sampled, loss_metrics = train_sampled_update(
+                source, learner, max_batch_size, agent_time_budget, device,
+                step, train_mode=1, store=store)
             batch = sampled.batch
-            if device == "cuda":
-                batch.to(device)
-            loss_metrics = learner.train(
-                batch=batch,
-                t_env=step,
-                episode_num=step,
-                buffer=store,
-                train_mode=1,
-            )
             if step % metrics_interval == 0:
                 metric_writer.write(
                     {

@@ -23,7 +23,8 @@ from tabx.teammate_modes import (
     load_teammate_modes, condition_metadata, add_baseline_deltas,
 )
 from tabx.config import load_yaml_config  # noqa: E402
-from tabx.provenance import encoder_sha256  # noqa: E402
+from tabx.evaluation_protocol import resolve_return_target
+from tabx.provenance import encoder_sha256, file_sha256, source_identity  # noqa: E402
 from tabx.manifest import TabxManifest, TabxTask  # noqa: E402
 from tabx.normalization import ObservationNormalizer  # noqa: E402
 from tabx.online_wrapper import TabxOnlineWrapper  # noqa: E402
@@ -70,9 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--task-id", action="append", dest="task_ids",
-        help="Evaluate only this manifest task. Repeatable; default is all tasks.",
+        help="Evaluate only this manifest task. Repeatable; defaults to tasks in the configured split.",
     )
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--split", choices=("train", "validation", "val", "test", "all"), default=None)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=10000)
     parser.add_argument("--tabx-root", type=Path, default=REPO_ROOT / "TABX")
     parser.add_argument("--raw-data-root", type=Path, default=DEFAULT_RAW_DATA)
@@ -433,7 +435,7 @@ def evaluate_task(
 
         rewards = np.asarray(reward_history, dtype=np.float32)
         normalized_rtg = np.cumsum(rewards[::-1], dtype=np.float64)[::-1]
-        normalized_rtg = normalized_rtg.astype(np.float32) / task.return_scale
+        normalized_rtg = normalized_rtg.astype(np.float32) / mac.args.online_return_scale
         store.add_completed_online_episode(
             mac.agent,
             np.asarray(obs_history, dtype=np.float32),
@@ -566,6 +568,7 @@ def main() -> int:
     data_cfg = dict(config["data"])
     retrieval_cfg = dict(config["retrieval"])
     training_cfg = dict(config.get("training", {}))
+    evaluation_cfg = dict(config.get("evaluation", {}))
     manifest = TabxManifest(Path(str(data_cfg["manifest"])))
     model_cfg = config.get("model", {})
     if cli.max_allies is None:
@@ -576,8 +579,11 @@ def main() -> int:
         cli.max_zones = int(model_cfg.get("n_zones", 4))
     tasks = (
         [manifest.task(task_id) for task_id in cli.task_ids]
-        if cli.task_ids else list(manifest.tasks)
+        if cli.task_ids else list(manifest.tasks_for_split(
+            getattr(cli, "split", None) or evaluation_cfg.get("task_split", "train")))
     )
+    return_targets = {task.task_id: resolve_return_target(manifest, task, evaluation_cfg)
+                      for task in tasks}
     raw_data_root = infer_raw_data_root(manifest, tasks, cli.raw_data_root)
     definitions = load_task_definitions(
         manifest=manifest,
@@ -607,7 +613,10 @@ def main() -> int:
     checkpoint_file = cli.checkpoint.expanduser().resolve() / "agent.th"
     checkpoint_stat = checkpoint_file.stat()
     run_spec = json.loads(json.dumps({
-        "schema": "tabx_teammates_v1", "config": config,
+        "schema": "tabx_teammates_v2", "config": config,
+        "source_identity": source_identity(),
+        "checkpoint_sha256": file_sha256(checkpoint_file),
+        "index_manifest_sha256": file_sha256(retrieval_cfg["index_manifest"]),
         "checkpoint": str(checkpoint_file),
         "checkpoint_size": checkpoint_stat.st_size,
         "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
@@ -621,7 +630,7 @@ def main() -> int:
             t.task_id: {
                 "physics": definitions[t.task_id].physics_name,
                 "enemy_heuristic": definitions[t.task_id].enemy_heuristic_name,
-                "return_scale": t.return_scale, "target_return": t.target_return,
+                **return_targets[t.task_id],
             } for t in tasks
         },
     }))
@@ -665,7 +674,6 @@ def main() -> int:
         normalizer=normalizer,
         k=args.k,
         search_k=args.l,
-        online_search_k=int(retrieval_cfg.get("online_search_k", 16)),
         device=device,
         seed=cli.seed,
         h5_lru_size=int(data_cfg.get("h5_lru_size", 16)),
@@ -674,7 +682,11 @@ def main() -> int:
         index_load_mode=str(retrieval_cfg.get("index_load_mode", "ram")),
         faiss_threads=int(retrieval_cfg.get("faiss_threads", 4)),
         trace_search=bool(retrieval_cfg.get("trace_search", False)),
-        utility_alpha=float(retrieval_cfg.get("utility_alpha", 0.8)),
+        weight=float(retrieval_cfg.get("weight", 0.8)),
+        ind_weight=float(retrieval_cfg.get("ind_weight", 0.2)),
+        max_similarity=args.max_similarity,
+        index_cache_size=int(retrieval_cfg.get("index_cache_size", 2)),
+        allow_approximate_index=bool(retrieval_cfg.get("allow_approximate_index", False)),
         use_utility=bool(retrieval_cfg.get("use_utility", True)),
         expected_encoder_sha256=encoder_sha256(mac.agent.state_dict()),
         normalization_path=Path(str(data_cfg["normalization"])),
@@ -709,8 +721,9 @@ def main() -> int:
                 seed_start = cli.seed
                 seed_everything(seed_start, device)
                 store.reset_online_memory(seed=seed_start)
-                args.online_return_scale = task.return_scale
-                args.online_target_rtg = task.target_return / task.return_scale
+                target = return_targets[task.task_id]
+                args.online_return_scale = target["return_scale"]
+                args.online_target_rtg = target["target_return"] / target["return_scale"]
                 definition = definitions[task.task_id]
                 env = build_environment(
                     tabx_root=cli.tabx_root, definition=definition, seed=seed_start,

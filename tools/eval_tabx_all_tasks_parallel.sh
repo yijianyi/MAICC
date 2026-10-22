@@ -9,19 +9,23 @@ set -euo pipefail
 #     bash tools/eval_tabx_all_tasks_parallel.sh
 # ---------------------------------------------------------------------------
 GPU_ID="${GPU_ID:-1}"
-PARALLEL_JOBS="${PARALLEL_JOBS:-7}"
-EPISODES="${EPISODES:-1000}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
+EPISODES="${EPISODES:-100}"
+EVAL_SPLIT="${EVAL_SPLIT:-train}"
 EPISODE_LIMIT="${EPISODE_LIMIT:-512}"
 BASE_SEED="${BASE_SEED:-20000}"
 
 PYTHON_BIN="${PYTHON_BIN:-/mnt/cfs/shaopt/conda_envs/MAICC_TABX/bin/python}"
-CONFIG="${CONFIG:-src/config/tabx/tabx_stage1.yaml}"
-CHECKPOINT="${CHECKPOINT:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0803_7task_stage1/step_000100000}"
+export MAICC_DATA_DIR="${MAICC_DATA_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100}"
+export MAICC_SEED="${MAICC_SEED:-7}"
+export MAICC_RUN_DIR="${MAICC_RUN_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v2_seed${MAICC_SEED}}"
+CONFIG="${CONFIG:-src/config/tabx/baseline_stage1.yaml}"
+CHECKPOINT="${CHECKPOINT:-$MAICC_RUN_DIR/stage1/step_000500000}"
 RAW_DATA_ROOT="${RAW_DATA_ROOT:-/mnt/cfs/shaopt/data/MARL/0803_overfit_7task_train_7000record_balance_winrate}"
-MANIFEST="${MANIFEST:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0803_7task_l32/manifest.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0803_all7_parallel_1000}"
+MANIFEST="${MANIFEST:-$MAICC_DATA_DIR/manifest.json}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$MAICC_RUN_DIR/eval_parallel}"
 
-# CPU threads used by each of the seven evaluator processes. FAISS has its own
+# CPU threads used by each evaluator process. FAISS has its own
 # `faiss_threads` setting under `retrieval` in CONFIG.
 CPU_THREADS_PER_JOB="${CPU_THREADS_PER_JOB:-1}"
 
@@ -54,7 +58,7 @@ is_positive_integer "$CPU_THREADS_PER_JOB" || \
 mkdir -p "$OUTPUT_ROOT"
 
 mapfile -t TASK_IDS < <(
-  "$PYTHON_BIN" - "$MANIFEST" <<'PY'
+  "$PYTHON_BIN" - "$MANIFEST" "$EVAL_SPLIT" <<'PY'
 import json
 import sys
 
@@ -67,7 +71,8 @@ if not isinstance(tasks, list) or not tasks:
     raise SystemExit(f"Manifest contains no tasks: {manifest_path}")
 
 for task in tasks:
-    print(task["task_id"])
+    if sys.argv[2] == "all" or task.get("split", "train") == sys.argv[2]:
+        print(task["task_id"])
 PY
 )
 
@@ -79,7 +84,7 @@ fi
 
 cat <<EOF
 [parallel-eval] gpu=$GPU_ID
-[parallel-eval] tasks=$TASK_COUNT parallel_jobs=$PARALLEL_JOBS
+[parallel-eval] split=$EVAL_SPLIT tasks=$TASK_COUNT parallel_jobs=$PARALLEL_JOBS
 [parallel-eval] episodes_per_task=$EPISODES episode_limit=$EPISODE_LIMIT
 [parallel-eval] checkpoint=$CHECKPOINT
 [parallel-eval] output_root=$OUTPUT_ROOT

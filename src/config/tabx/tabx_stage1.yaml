@@ -8,6 +8,8 @@ data:
 model:
   # Must match the stage-0 checkpoint architecture exactly.
   agent: tabx_transformer
+  cem_architecture: dense
+  gradient_checkpointing: true
   max_agents: 10
   episode_limit: 512
   n_embd: 64
@@ -15,7 +17,7 @@ model:
   n_head: 8
   hidden_dim: 128
   n_zones: 4
-  obs_visible_weight: 4.0
+  obs_visible_weight: 1.0
   dropout: 0.1
   encoder_use_rtg: false
   policy_use_rtg: true
@@ -25,10 +27,12 @@ training:
   device: auto
   seed: 7
   total_steps: 100000
-  max_batch_size: 4
-  agent_time_budget: 4096
+  max_batch_size: 32
+  # Limits a microbatch; gradient accumulation preserves max_batch_size.
+  agent_time_budget: 1024
   learning_rate: 0.0005
-  grad_norm_clip: 10.0
+  grad_norm_clip: 0.0
+  dt_loss_reduction: sum
   use_amp: false
   max_return: auto
   min_return: auto
@@ -37,28 +41,34 @@ training:
   metrics_interval: 1
   metrics_file: training_metrics.csv
   save_interval: 10000
-  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage1
+  output_dir: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_faithful_v2_stage1
 
 retrieval:
   k: 2
-  search_k: 128
-  # HNSW performs random graph reads. Loading these ~2.5 GiB indexes into RAM
-  # avoids pathological page faults when the files live on /mnt/cfs.
+  search_k: 50
+  # Load at most index_cache_size exact-prefix indexes in RAM.
   index_load_mode: ram
   faiss_threads: 4
   # Enable while validating a new runtime; disable for full evaluation after
   # search latency and query finiteness have been confirmed.
   trace_search: true
-  # Online queries do not need same-record exclusion; start small and expand
-  # adaptively if two source-diverse contexts are not found.
-  online_search_k: 16
   max_similarity: 0.98
-  history_buckets: [1, 4, 8, 16, 32]
-  index_factory: HNSW32,Flat
+  prefix_policy: exact_all_windows
+  index_factory: Flat
+  index_cache_size: 2
+  allow_approximate_index: false
   index_batch_rows: 8
   # 0 indexes all rows. Set a positive cap only for a smoke test; selected
   # rows are then spread evenly across each task.
   max_index_rows_per_task: 0
-  stage0_checkpoint: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_stage0/step_000100000
-  index_dir: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval
-  index_manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval/retrieval_manifest.json
+  stage0_checkpoint: /mnt/cfs/shaopt/data/MARL/maicc_results/0803_7task_faithful_v2_stage0/step_000100000
+  index_dir: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval_v4
+  index_manifest: /mnt/cfs/shaopt/data/MARL/maicc_tabx/0803_7task_l32/retrieval_v4/retrieval_manifest.json
+
+  weight: 0.8
+  ind_weight: 0.2
+  use_utility: true
+
+evaluation:
+  task_split: train
+  target_return_mode: train_only

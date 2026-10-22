@@ -6,6 +6,8 @@ data:
   preserve_zero_padding: true
 model:
   agent: tabx_transformer
+  cem_architecture: dense
+  gradient_checkpointing: true
   max_agents: 10
   episode_limit: 512
   n_embd: 64
@@ -13,7 +15,7 @@ model:
   n_head: 8
   hidden_dim: 128
   n_zones: 10
-  obs_visible_weight: 4.0
+  obs_visible_weight: 1.0
   dropout: 0.1
   encoder_use_rtg: false
   policy_use_rtg: true
@@ -22,11 +24,13 @@ model:
 training:
   device: auto
   seed: ${MAICC_SEED}
-  total_steps: 100000
+  total_steps: 500000
   max_batch_size: 32
-  agent_time_budget: 4096
+  # Limits a microbatch; gradient accumulation preserves max_batch_size.
+  agent_time_budget: 1024
   learning_rate: 0.0005
-  grad_norm_clip: 10.0
+  grad_norm_clip: 0.0
+  dt_loss_reduction: sum
   use_amp: false
   max_return: auto
   min_return: auto
@@ -38,25 +42,24 @@ training:
   output_dir: ${MAICC_RUN_DIR}/stage1
 retrieval:
   k: 2
-  search_k: 128
+  search_k: 50
   index_load_mode: ram
   faiss_threads: 4
   trace_search: false
-  online_search_k: 16
   max_similarity: 0.98
-  history_buckets:
-  - 1
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 100
-  index_factory: HNSW32,Flat
+  prefix_policy: exact_all_windows
+  index_factory: Flat
+  index_cache_size: 2
+  allow_approximate_index: false
   index_batch_rows: 8
   max_index_rows_per_task: 0
-  stage0_checkpoint: ${MAICC_RUN_DIR}/stage0/step_000100000
+  stage0_checkpoint: ${MAICC_RUN_DIR}/stage0/step_000500000
   index_dir: ${MAICC_RUN_DIR}/retrieval
   index_manifest: ${MAICC_RUN_DIR}/retrieval/retrieval_manifest.json
-  utility_alpha: 0.8
+  weight: 0.8
+  ind_weight: 0.2
   use_utility: true
+
+evaluation:
+  task_split: train
+  target_return_mode: train_only

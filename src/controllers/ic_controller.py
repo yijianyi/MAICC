@@ -63,8 +63,12 @@ class ICMAC:
             query_embeddings, _ = self.agent.get_dem_traj_embedding(
                 active_pre, active_obs, active_action.squeeze(-1), active_post)
         query_embeddings = query_embeddings.cpu().numpy()
-        retrieval = self.buffer.mips(
-            query_embeddings, t, test_mode=test_mode)
+        if self.args.env == "tabx":
+            retrieval = self.buffer.mips(
+                query_embeddings, active_obs.shape[1] - 1,
+                test_mode=test_mode, agent_ids=active_ids.cpu().tolist())
+        else:
+            retrieval = self.buffer.mips(query_embeddings, t, test_mode=test_mode)
         if len(retrieval) == 7:
             co, cr, ca, ct, cm, context_rtg, context_completion = retrieval
         else:
@@ -204,8 +208,7 @@ class ICMAC:
         else:
             self.seq_present = th.cat([self.seq_present, present], dim=1)
 
-        # Online episodes may last 512 steps, while every transformer was
-        # configured for a 32-step rolling history.
+        # The same explicit bounded history is used by training and indexing.
         history = int(getattr(self.args, "context_length", 32))
         self.seq_pre = self.seq_pre[:, -history:]
         self.seq_obs = self.seq_obs[:, -history:]

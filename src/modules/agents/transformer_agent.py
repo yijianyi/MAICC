@@ -4,6 +4,7 @@ from typing import Optional, Tuple, Union
 import torch.nn as nn
 import torch as th
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 LOG_VAR_MIN = -2
 LOG_VAR_MAX = 0
@@ -16,7 +17,7 @@ class CustomGPT2Model(GPT2Model):
         for block in self.h:
             block.attn.bias[:] = True
 
-    def custom_forward(self, inputs_embeds, n_agents):
+    def custom_forward(self, inputs_embeds, n_agents, present_mask=None):
         batch_size, seq_len = inputs_embeds.shape[0], inputs_embeds.shape[1]
         mask = th.tril(th.ones((1, seq_len, seq_len), dtype=th.bool)).to(
             inputs_embeds.device)
@@ -46,7 +47,27 @@ class CustomGPT2Model(GPT2Model):
                     start_idx = i - i % traj_len
                     end_idx = i - i % traj_len + 2 * n_agents
                 mask[0][i][start_idx:end_idx] = True
-        return self.forward(inputs_embeds=inputs_embeds, attention_mask=mask)
+        valid = None
+        if present_mask is not None:
+            timesteps = seq_len // traj_len
+            present = present_mask.reshape(batch_size, timesteps, n_agents).bool()
+            valid = th.ones(batch_size, timesteps, traj_len, dtype=th.bool,
+                            device=inputs_embeds.device)
+            valid[:, :, o] = present
+            valid[:, :, a] = present
+            valid = valid.reshape(batch_size, seq_len)
+            mask = mask.expand(batch_size, -1, -1).clone()
+            mask &= valid[:, None, :]
+            # Padded query rows attend only to themselves, avoiding an empty
+            # softmax. Their outputs are discarded; valid tokens cannot read them.
+            batch_ids, query_ids = th.where(~valid)
+            mask[batch_ids, query_ids, :] = False
+            mask[batch_ids, query_ids, query_ids] = True
+        result = self.forward(inputs_embeds=inputs_embeds, attention_mask=mask)
+        if valid is not None:
+            result.last_hidden_state = result.last_hidden_state.masked_fill(
+                ~valid.unsqueeze(-1), 0.0)
+        return result
 
     def forward(
         self,
@@ -108,7 +129,7 @@ class CustomGPT2Model(GPT2Model):
         if attention_mask is not None:
             if batch_size <= 0:
                 raise ValueError("batch_size has to be defined and > 0")
-            assert (attention_mask.size(0) == 1)
+            assert attention_mask.size(0) in (1, batch_size)
             assert (attention_mask.size(1) == seq_len)
             assert (attention_mask.size(2) == seq_len)
             attention_mask = attention_mask[:, None, :, :]
@@ -179,7 +200,7 @@ class CustomGPT2Model(GPT2Model):
 
                     return custom_forward
 
-                outputs = th.utils.checkpoint.checkpoint(
+                outputs = checkpoint(
                     create_custom_forward(block),
                     hidden_states,
                     None,
@@ -187,6 +208,7 @@ class CustomGPT2Model(GPT2Model):
                     head_mask[i],
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    use_reentrant=False,
                 )
             else:
                 outputs = block(
@@ -350,6 +372,9 @@ class TransformerAgent(nn.Module):
         self.DT_post_embd = nn.Linear(
             3, self.n_embd)  # [rew, term, completion]
 
+        # CustomGPT2Model supplies the original nonstandard same-time mask.
+        # Keep its explicit attention path independent of library auto-selection.
+        CEM_config._attn_implementation = "eager"
         self.CEM = CustomGPT2Model(CEM_config, self.args.use_rtg)
         self.DEM = GPT2Model(DEM_config)
         self.DT = GPT2Model(DT_config)
@@ -399,7 +424,7 @@ class TransformerAgent(nn.Module):
                 raise ValueError("TABX observation layout/n_zones mismatch")
             other_blocks = remainder // 16
             visible_weight = float(
-                getattr(self.args, "obs_visible_weight", 4.0)
+                getattr(self.args, "obs_visible_weight", 1.0)
             )
             for block in range(other_blocks):
                 start = 14 + 16 * block
