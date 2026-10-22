@@ -8,10 +8,10 @@ model:
   agent: tabx_transformer
   max_agents: 10
   episode_limit: 512
-  n_embd: 64
+  n_embd: 256
   n_layer: 8
   n_head: 8
-  hidden_dim: 128
+  hidden_dim: 512
   n_zones: 10
   obs_visible_weight: 4.0
   dropout: 0.1

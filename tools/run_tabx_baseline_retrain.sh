@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export MAICC_DATA_DIR="${MAICC_DATA_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100}"
 export MAICC_SEED="${MAICC_SEED:-7}"
-export MAICC_RUN_DIR="${MAICC_RUN_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v1_seed${MAICC_SEED}}"
+export MAICC_RUN_DIR="${MAICC_RUN_DIR:-/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v1_d256_seed${MAICC_SEED}}"
 BASELINE_PYTHON="${BASELINE_PYTHON:-python}"
 BASELINE_STAGE0=src/config/tabx/baseline_stage0.yaml
 BASELINE_STAGE1=src/config/tabx/baseline_stage1.yaml

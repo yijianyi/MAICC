@@ -39,7 +39,7 @@ history_projection 参数，不要用 strict=False 绕过，也不要从旧模�
 ```bash
 export MAICC_DATA_DIR=/mnt/cfs/shaopt/data/MARL/yxq/maicc_tabx/0811_16task_l100
 export MAICC_SEED=7
-export MAICC_RUN_DIR=/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v1_seed7
+export MAICC_RUN_DIR=/mnt/cfs/shaopt/data/MARL/yxq/maicc_results/0811_16task_l100_baseline_v1_d256_seed7
 
 bash tools/run_tabx_baseline_retrain.sh check
 bash tools/run_tabx_baseline_retrain.sh smoke
@@ -47,7 +47,7 @@ bash tools/run_tabx_baseline_retrain.sh all
 ```
 
 `smoke` 在单独目录执行两个真实 stage0 优化步骤，不替代完整训练。
-`all` 依次执行检查、stage0 100000 步、索引构建、stage1 100000 步。
+`all` 依次执行检查、stage0 500000 步、索引构建、stage1 500000 步。
 索引构建额外计算完整 episode 的预测个体回报，会比旧版更慢；保留磁盘空间存放新索引。
 不自动覆盖已有 checkpoint；重复运行时应使用新目录或明确 resume。
 
@@ -66,9 +66,14 @@ bash tools/run_tabx_baseline_retrain.sh stage0 --resume "$MAICC_RUN_DIR/stage0/s
 bash tools/run_tabx_baseline_retrain.sh stage1 --resume "$MAICC_RUN_DIR/stage1/step_000050000"
 ```
 
-配置保持原 n_embd=64、层数=8、heads=8、dropout=0.1、lr=5e-4、最大 batch=32、
-agent_time_budget=4096；100 步×10 槽位下有效 batch 仍为 4，以便与已有运行比较。
-如果要改成有效 batch 32，需将预算至少调至 32000，并独立记录该实验设置和显存需求。
+当前扩容配置为 n_embd=256、hidden_dim=512；层数=8、heads=8、dropout=0.1、
+lr=5e-4、最大 batch=32、agent_time_budget=32000，保持修改前的训练设置。
+100 步×10 槽位下有效 batch 为 32，实际显存需求须在服务器上通过 smoke 验证。
+stage0 和 stage1 的模型配置同步修改；当前实现共用架构参数，因此 CEM、DEM 和 DT
+都会使用 256 维表示，CEM 仍为 4 层空间注意力加 4 层时间注意力。
+原 HDF5、manifest 和归一化文件可直接复用，但不能从 64 维 checkpoint resume，
+也不能复用旧检索索引；须从头训练 stage0、重建索引、再训练 stage1。
+脚本默认使用带 d256 标记的新输出目录；如果已经设置 MAICC_RUN_DIR，须改为新的目录。
 多训练种子使用不同 MAICC_SEED 和 MAICC_RUN_DIR；每个种子重建自己的索引。
 
 ## 评估和论文记录
