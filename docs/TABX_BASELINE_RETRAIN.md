@@ -4,6 +4,9 @@
 默认仍使用 manifest 指定的有限历史（现有数据为 100 步），不是 512 步完整历史复现。
 TABX 观测、有效单位屏蔽、动作编码、团队奖励和完成标志属于必要环境适配。
 
+按 reference distribution 文件是否存在划分 RL/advance 两组，并分别运行原版 behavior
+监督训练的流程见 [TABX_LABEL_GROUPS.md](TABX_LABEL_GROUPS.md)。
+
 0930 的 `*_comm_agent` 数据从联合轨迹定位开始，完整命令见
 [TABX_0930_TRAINING.md](TABX_0930_TRAINING.md)。该目录不能直接交给联合轨迹转换器。
 正式 baseline 默认每阶段 500000 次更新，与用户确认的旧实验预算一致。
